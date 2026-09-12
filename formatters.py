@@ -17,8 +17,6 @@ from models import ResponseFormat
 from constants import (
     HIGHLIGHT_CONTEXT_CHARS,
     HIGHLIGHT_PREVIEW_CHARS,
-    SNIPPET_PREVIEW_LENGTH,
-    TEXT_TRUNCATION_LIMIT,
 )
 
 
@@ -73,12 +71,21 @@ def parse_part_data(raw_data: str) -> dict[str, Any]:
         if isinstance(parsed, dict):
             if "text" in parsed and isinstance(parsed["text"], str):
                 parsed["text"] = sanitize_text(parsed["text"])
+            # For tool-type parts, extract the output from state.output
+            # since tools do not have a top-level "text" field.
+            if parsed.get("type") == "tool" and not parsed.get("text"):
+                state = parsed.get("state") or {}
+                output = state.get("output")
+                if isinstance(output, str) and output:
+                    parsed["text"] = output
+                elif isinstance(output, dict):
+                    parsed["text"] = json.dumps(output)
             return parsed
         return {"type": "unknown", "text": sanitize_text(str(parsed))}
     except (json.JSONDecodeError, TypeError):
         return {
             "type": "parse_error",
-            "text": sanitize_text(raw_data[:SNIPPET_PREVIEW_LENGTH]),
+            "text": sanitize_text(raw_data),
         }
 
 
@@ -199,16 +206,16 @@ def format_messages(
         ]
         for msg in messages:
             type_label = msg["type"].upper().replace("_", " ")
-            text_preview = msg["text"][:SNIPPET_PREVIEW_LENGTH] if msg["text"] else "(empty)"
-            if msg["full_text_length"] > SNIPPET_PREVIEW_LENGTH:
-                text_preview += f" (truncated, {msg['full_text_length']} chars total)"
+            text_preview = msg["text"] if msg["text"] else "(empty)"
 
             lines.append("---")
-            lines.append(f"**Message {msg['index'] + 1}**")
+            lines.append(f"- **Part ID**: `{msg['part_id']}`")
             lines.append(f"- **Type**: `{type_label}`")
             lines.append(f"- **Time**: {msg['time_created']}")
-            if msg["message_id"]:
-                lines.append(f"- **Message ID**: `{msg['message_id']}`")
+            if msg.get("state_title"):
+                lines.append(f"- **State Title**: `{msg['state_title']}`")
+            if msg.get("state_tool"):
+                lines.append(f"- **State Tool**: `{msg['state_tool']}`")
             lines.append(f"- **Content**:")
             lines.append(f"```\n{text_preview}\n```")
             lines.append("")
@@ -287,9 +294,10 @@ def format_recall(
 
             if session_key not in seen_sessions:
                 seen_sessions.add(session_key)
+                server_info = f" · Server: {m['server']}" if m.get("server") else ""
                 dir_info = f" (`{m['directory']}`)" if m.get("directory") else ""
                 agent_info = f" · Agent: {m['agent']}" if m.get("agent") else ""
-                lines.append(f"## 📂 {title} (`{session_key}`){dir_info}{agent_info}")
+                lines.append(f"## 📂 {title} (`{session_key}`){server_info}{dir_info}{agent_info}")
                 lines.append("")
 
             type_label = m["part_type"].upper().replace("_", " ")
@@ -298,8 +306,10 @@ def format_recall(
                 f"### 💬 Message `{m['part_id']}` "
                 f"({type_label} · {ts_str})"
             )
-            if m.get("message_id"):
-                lines.append(f"- **Message ID**: `{m['message_id']}`")
+            if m.get("tool"):
+                lines.append(f"- **Tool**: `{m['tool']}`")
+            if m.get("title"):
+                lines.append(f"- **Title**: `{m['title']}`")
             if m["snippet"]:
                 lines.append(f"```\n{m['snippet']}\n```")
             lines.append("")

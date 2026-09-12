@@ -34,9 +34,44 @@ pip install -r requirements.txt
           "/home/opencode/workspace/netpascal_mcp_memory/server.py"
         ],
         "environment": {
-          "DATABASE_PATH": "/home/opencode/.local/share/opencode/opencode.db:rw"
+          "DATABASE_PATH": "/home/opencode/.local/share/opencode/opencode.db:rw",
+          "SERVER_NAME":"memory"
         }
       }
   }
 }
 ```
+
+Environment variables:
+*    DATABASE_PATH  (required)    Primary opencode DB path.
+*    SERVER_NAME    (required)    Unique tag for this MCP instance (e.g. 'prod', 'dev').
+*    FTS_DB_PATH    (optional)    Shared FTS5 index path, otherwise DATABASE_PATH is used with a default suffix
+
+
+
+## Architecture
+
+MCP read primary opencode database (via
+``DATABASE_PATH``) and writes to a **shared** FTS index (via
+``FTS_DB_PATH``).  The ``SERVER_NAME`` env var identifies this instance
+so that rows in the shared FTS index are tagged and can be filtered.
+
+    ┌────────────────────────────────────┐ 
+    │  MCP instance                      │s
+    │  SERVER_NAME=memory                │
+    │                                    │
+    │  DB:             (opencode.db)     │
+    │                       │            │ 
+    │  ┌────────┐           │            │
+    │  │  part  │───────────┼────────────┤─────────────────────────────
+    │  └────────┘           │            │                             │
+    │  ┌────────┐           │            │                             │
+    │  │session │────────── ┼            │                             │
+    │  └────────┘                        │                             │
+    └────────────────────────────────────┘                             │            
+                                                                       │
+    FTS Database created (opencode.db_fts.db)                          │
+    ┌──────────────────────────────────────────────────────────────┐   │
+    │  part_fts  (FTS5)  ← includes a "server" column for tagging  │ ◄─┘
+    │  part_fts_meta (per-server watermarks)                       │
+    └──────────────────────────────────────────────────────────────┘

@@ -25,6 +25,8 @@ os.environ.setdefault(
     "DATABASE_PATH",
     os.path.expanduser("~/.local/share/opencode/opencode.db") + ":rw",
 )
+# SERVER_NAME is required in the new architecture
+os.environ.setdefault("SERVER_NAME", "memory")
 
 # Import clean_db_path helper for sqlite3.connect() calls
 import sys

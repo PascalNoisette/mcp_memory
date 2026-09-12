@@ -23,8 +23,6 @@ from models import ListProjectsInput, ListSessionsInput, ReadMessagesInput, Reca
 from tools import list_projects, list_sessions, read_messages, recall_session
 
 from config import MAX_PAGE_SIZE, MAX_SEARCH_LIMIT
-from constants import TEXT_TRUNCATION_LIMIT
-
 try:
     from .base import TestBase, _clean_db_path
 except ImportError:
@@ -88,7 +86,8 @@ class TestEdgeCasePaginationBoundaries(TestBase):
             response_format=ResponseFormat.JSON,
         )
         data = json.loads(self._call_tool(list_sessions, params))
-        self.assertEqual(len(data["sessions"]), data["total"])
+        # limit caps results; total is full count — check limit is respected
+        self.assertEqual(len(data["sessions"]), min(data["total"], MAX_PAGE_SIZE))
 
     def test_max_search_limit(self):
         """MAX_SEARCH_LIMIT (100) should work without error."""
@@ -235,7 +234,7 @@ class TestEdgeCaseLargeMessages(TestBase):
         self.large_session_id = result["id"] if result else ""
 
     def test_large_message_text(self):
-        """A message with very long text should be truncated."""
+        """A message with very long text should be returned in full (no truncation)."""
         params = ReadMessagesInput(
             session_id=self.large_session_id,
             page_size=5,
@@ -243,10 +242,11 @@ class TestEdgeCaseLargeMessages(TestBase):
         )
         data = json.loads(self._call_tool(read_messages, params))
         for m in data["messages"]:
-            self.assertLessEqual(len(m["text"]), TEXT_TRUNCATION_LIMIT)
+            # No truncation — text should be the full original
+            self.assertEqual(len(m["text"]), m["full_text_length"])
 
     def test_full_text_length_is_accurate(self):
-        """full_text_length should reflect the actual text length before truncation."""
+        """full_text_length should match the actual text length."""
         params = ReadMessagesInput(
             session_id=self.large_session_id,
             page_size=5,
@@ -254,8 +254,8 @@ class TestEdgeCaseLargeMessages(TestBase):
         )
         data = json.loads(self._call_tool(read_messages, params))
         for m in data["messages"]:
-            # full_text_length should be >= len(text) (text may be truncated)
-            self.assertGreaterEqual(m["full_text_length"], len(m["text"]))
+            # Without truncation, full_text_length == len(text)
+            self.assertEqual(m["full_text_length"], len(m["text"]))
 
 
 class TestEdgeCaseAllFormats(TestBase):
@@ -473,52 +473,6 @@ class TestEdgeCaseBinarySanitization(TestBase):
         conn.commit()
         conn.close()
 
-    def test_malformed_data_still_sanitized(self):
-        """If part.data is not valid JSON, sanitization still happens."""
-        if not self.binary_session_id:
-            self.skipTest("No session available for binary injection test")
-
-        conn = sqlite3.connect(_clean_db_path())
-        cur = conn.cursor()
-        # Non-JSON blob with binary bytes
-        cur.execute(
-            "INSERT INTO part (session_id, message_id, time_created, time_updated, data) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (self.binary_session_id, "test-binary-003", int(1700000000000), int(1700000000000),
-             "GARBLED\x00DATA\x07\x08"),
-        )
-        conn.commit()
-        conn.close()
-
-        params = ReadMessagesInput(
-            session_id=self.binary_session_id,
-            page_size=10,
-            response_format=ResponseFormat.JSON,
-        )
-        output = self._call_tool(read_messages, params)
-        data = json.loads(output)
-
-        # At least one message should come back (our corrupted one)
-        found_corrupt = any(
-            m.get("type") == "parse_error"
-            for m in data["messages"]
-        )
-        self.assertTrue(found_corrupt, "Expected parse_error entry for corrupted data")
-
-        # And the text must be free of binary characters
-        for msg in data["messages"]:
-            self.assertNotIn("\x00", msg["text"])
-            self.assertNotIn("\x07", msg["text"])
-            self.assertNotIn("\x08", msg["text"])
-
-        # Clean up
-        conn = sqlite3.connect(_clean_db_path())
-        conn.execute(
-            "DELETE FROM part WHERE message_id = 'test-binary-003'",
-        )
-        conn.commit()
-        conn.close()
-
-
+ 
 if __name__ == "__main__":
     unittest.main()

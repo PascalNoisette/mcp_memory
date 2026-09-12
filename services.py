@@ -5,14 +5,22 @@ Business-logic / query layer for the Kilo Code MCP Memory Server.
 Each function accepts validated parameters and returns structured Python
 data (lists of dicts).  Formatting into Markdown or JSON is handled by
 *formatters.py*.
+
+## Recall queries
+
+The FTS index (``part_fts``) stores **all metadata needed for recall**:
+session_id, message_id, part_id, directory, agent, server, session
+title/slug, and timestamps.  Queries run entirely against the FTS table
+— no JOIN to the primary database is needed.
 """
 
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
-from database import get_db, is_fts_available
-from constants import HIGHLIGHT_CONTEXT_CHARS, TEXT_TRUNCATION_LIMIT
+from database import get_db, get_fts_db, is_fts_available
+from constants import HIGHLIGHT_CONTEXT_CHARS
 from formatters import (
     format_timestamp,
     highlight_match,
@@ -29,6 +37,28 @@ def _query(sql: str, params: tuple = (), fetch_all: bool = True):
     ``fetchone`` produces no result.
     """
     conn = get_db()
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    if fetch_all:
+        return cur.fetchall()
+    return cur.fetchone()
+
+
+def _query_fts(sql: str, params: tuple = (), fetch_all: bool = True):
+    """Execute a SELECT query against the **FTS** database.
+
+    Since the FTS table now stores all metadata needed for recall queries,
+    no cross-database attachment is required.
+
+    Args:
+        sql: The SQL query (references ``fts.part_fts``).
+        params: Query parameters.
+        fetch_all: If True, return all rows; otherwise return the first row.
+
+    Returns:
+        Query results as a list of dicts (or a single dict if fetch_all=False).
+    """
+    conn = get_fts_db()
     cur = conn.cursor()
     cur.execute(sql, params)
     if fetch_all:
@@ -53,9 +83,8 @@ def _ensure_fts_available() -> None:
     """
     if not is_fts_available():
         raise FTSUnavailableError(
-            "Please reindex the database — the full-text search table "
-            "(part_fts) is missing. If the database file is writable, FTS "
-            "will be recreated automatically on the next server restart. "
+            "The full-text search index is not available. "
+            "It will be created automatically on the next MCP server start. "
             "Meanwhile, all read tools (list_projects, list_sessions, "
             "read_messages) continue to work normally."
         )
@@ -161,9 +190,14 @@ def _fetch_messages_with_count(
     conn = get_db()
     cur = conn.cursor()
 
-    # 1. Total count (snapshot at transaction start)
+    # 1. Total count (snapshot at transaction start) — exclude step-start/step-finish
     cur.execute(
-        "SELECT COUNT(*) as cnt FROM part WHERE session_id = ?",
+        """
+        SELECT COUNT(*) as cnt FROM part
+        WHERE session_id = ?
+          AND json_valid(data) = 1
+          AND json_extract(data, '$.type') NOT IN ('step-start', 'step-finish')
+        """,
         (session_id,),
     )
     total = cur.fetchone()["cnt"]
@@ -171,9 +205,13 @@ def _fetch_messages_with_count(
     # 2. Paginated messages (same snapshot — no new inserts visible)
     cur.execute(
         """
-        SELECT id, message_id, time_created, data
+        SELECT id, message_id, time_created, data,
+               json_extract(data, '$.state.title') AS state_title,
+               json_extract(data, '$.state.tool')  AS state_tool
         FROM part
         WHERE session_id = ?
+          AND json_valid(data) = 1
+          AND json_extract(data, '$.type') NOT IN ('step-start', 'step-finish')
         ORDER BY time_created ASC
         LIMIT ? OFFSET ?
         """,
@@ -182,19 +220,19 @@ def _fetch_messages_with_count(
     rows = cur.fetchall()
 
     messages: list[dict[str, Any]] = []
-    for idx, row in enumerate(rows, start=offset):
+    for row in rows:
         parsed = parse_part_data(row["data"] or "{}")
         text = sanitize_text(parsed.get("text", ""))
         messages.append(
             {
-                "index": idx,
                 "part_id": row["id"],
-                "message_id": row["message_id"],
                 "time_created": format_timestamp(row["time_created"]),
                 "type": parsed.get("type", "unknown"),
-                "text": text[:TEXT_TRUNCATION_LIMIT] if len(text) > TEXT_TRUNCATION_LIMIT else text,
+                "text": text,
                 "full_text_length": len(text),
                 "raw_data": row["data"],
+                "state_title": row["state_title"],
+                "state_tool": row["state_tool"],
             }
         )
 
@@ -236,12 +274,18 @@ def _build_fts_where_clause(
     directory: Optional[str],
     keywords: list[str],
     agent: Optional[str] = None,
+    server: Optional[str] = None,
+    title: Optional[str] = None,
+    tool: Optional[str] = None,
 ) -> tuple[str, list]:
     """Build a parameterised WHERE clause for the FTS5 index.
 
-    Uses ``part_fts MATCH`` (full-text search) instead of ``LIKE`` on
+    Uses ``fts.part_fts MATCH`` (full-text search) instead of ``LIKE`` on
     the raw JSON ``part.data`` column.  This eliminates JSON noise,
     provides BM25 relevance ranking, and is dramatically faster.
+
+    All filterable columns (directory, agent, server) are stored directly
+    in the FTS table — no JOIN to the primary database is needed.
 
     Returns ``(clause_sql, params)`` where *clause_sql* starts with ``WHERE``
     (or is empty when the caller prepends nothing).
@@ -249,20 +293,44 @@ def _build_fts_where_clause(
     parts: list[str] = []
     params: list[Any] = []
 
+    # Track whether we should exclude tool parts.
+    # Exclude tool parts only when neither title nor tool filter is active.
+    show_tool_parts = (title is not None) or (tool is not None)
+
     if directory:
-        parts.append("s.directory = ?")
+        parts.append("part_fts.directory = ?")
         params.append(directory)
 
     if agent:
-        parts.append("s.agent = ?")
+        parts.append("part_fts.agent = ?")
         params.append(agent)
+
+    if server:
+        parts.append("part_fts.server = ?")
+        params.append(server)
+
+    # Only exclude tool-type parts when neither title nor tool filter is used.
+    if not show_tool_parts:
+        parts.append("part_fts.part_type != 'tool'")
+
+    if title:
+        # Fulltext search on part_fts.title column.
+        # Split by spaces and quote each keyword for FTS5 MATCH.
+        title_keywords = [kw.strip() for kw in title.split() if kw.strip()]
+        if title_keywords:
+            quoted = " ".join(f'"{kw}"' for kw in title_keywords)
+            parts.append("part_fts.title MATCH ?")
+            params.append(quoted)
+
+    if tool:
+        # Exact match on part_fts.tool column.
+        parts.append("part_fts.tool = ?")
+        params.append(tool)
 
     if keywords:
         # Join keywords with spaces — FTS5 treats spaces as implicit OR
         # (matching any keyword).  For AND semantics users can pass
         # explicit ``AND`` in the keyword string.
-        # Note: FTS5 MATCH does not support table aliases, so we must
-        # use the real table name ``part_fts`` here.
         # Quote each keyword individually to handle special characters
         # (hyphens in UUIDs, etc.) that FTS5 might interpret as boolean
         # operators, while still allowing space-separated multi-term OR.
@@ -280,23 +348,28 @@ def fetch_recall_stats(
     directory: Optional[str],
     keywords: list[str],
     agent: Optional[str] = None,
+    server: Optional[str] = None,
+    title: Optional[str] = None,
+    tool: Optional[str] = None,
 ) -> tuple[int, int]:
     """Return ``(total_matches, total_sessions)`` for the given search.
 
     ``total_matches`` = number of part rows matching the keywords.
     ``total_sessions`` = number of distinct sessions containing matches.
 
+    All queries run against the FTS table only — no JOIN to the primary
+    database is needed because all metadata is stored in the FTS index.
+
     Raises:
         FTSUnavailableError: If the full-text search table is not available.
     """
     _ensure_fts_available()
-    where, params = _build_fts_where_clause(directory, keywords, agent)
+    where, params = _build_fts_where_clause(directory, keywords, agent, server, title, tool)
 
-    row = _query(
+    row = _query_fts(
         f"""
         SELECT COUNT(DISTINCT part_fts.session_id)
         FROM part_fts
-        JOIN session s ON part_fts.session_id = s.id
         {where}
         """,
         params,
@@ -304,11 +377,10 @@ def fetch_recall_stats(
     )
     total_sessions = row[0] if row else 0
 
-    row = _query(
+    row = _query_fts(
         f"""
         SELECT COUNT(*)
         FROM part_fts
-        JOIN session s ON part_fts.session_id = s.id
         {where}
         """,
         params,
@@ -325,51 +397,80 @@ def fetch_recall_results(
     limit: int,
     offset: int,
     agent: Optional[str] = None,
+    server: Optional[str] = None,
+    title: Optional[str] = None,
+    tool: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Return a page of search-match results.
 
     Uses the FTS5 ``part_fts`` index so results are ranked by BM25
     relevance (lower score = more relevant) rather than by recency.
 
+    All metadata (session title, directory, agent, server, timestamps,
+    part_id) is stored directly in the FTS table — no JOIN to the primary
+    database is needed.
+
     Raises:
         FTSUnavailableError: If the full-text search table is not available.
     """
     _ensure_fts_available()
-    where, params = _build_fts_where_clause(directory, keywords, agent)
+    where, params = _build_fts_where_clause(directory, keywords, agent, server, title, tool)
 
-    rows = _query(
+    # Build exact-phrase text for `instr()` phrase boosting.
+    # Only apply phrase boosting when 2+ keywords are provided —
+    # a phrase requires at least two words to be meaningful.
+    phrase_text: Optional[str] = None
+    if len(keywords) >= 2:
+        phrase_text = ' '.join(keywords)
+
+    # Conditionally build ORDER BY with phrase bonus.
+    # The CASE subtracts 3.0 from bm25 when the row also contains
+    # the exact phrase, making it more negative = higher rank.
+    # We use `instr()` (not FTS5 MATCH) because SQLite does not
+    # allow the MATCH operator inside CASE expressions.
+    # Phrase param must be placed *before* LIMIT/OFFSET in the
+    # params tuple because it is used as a ? placeholder in ORDER BY.
+    if phrase_text:
+        order_by = (
+            "ORDER BY bm25(part_fts) "
+            "- CASE WHEN instr(part_fts.text, ?) > 0 THEN 3.0 "
+            "ELSE 0.0 END ASC"
+        )
+        query_params: tuple = (*params, phrase_text, limit, offset)
+    else:
+        order_by = "ORDER BY bm25(part_fts) ASC"
+        query_params = (*params, limit, offset)
+
+    rows = _query_fts(
         f"""
         SELECT
-            p.id             AS part_id,
-            p.data,
             part_fts.session_id,
-            part_fts.message_id,
-            p.time_created   AS part_time_created,
             part_fts.text    AS fts_text,
-            s.slug           AS session_slug,
-            s.title          AS session_title,
-            s.time_created   AS session_time_created,
-            s.directory      AS session_directory,
-            s.agent,
-            s.model,
-            ROUND(bm25(part_fts), 2) AS bm25_score
+            part_fts.session_slug      AS session_slug,
+            part_fts.session_title     AS session_title,
+            part_fts.server            AS server,
+            part_fts.session_time_created   AS session_time_created,
+            part_fts.directory         AS session_directory,
+            part_fts.agent,
+            part_fts.part_id           AS part_id,
+            part_fts.part_type         AS part_type,
+            part_fts.part_time_created AS part_time_created,
+            part_fts.tool              AS tool,
+            part_fts.title             AS title,
+            ROUND(bm25(part_fts), 2)   AS bm25_score
         FROM part_fts
-        JOIN part p ON part_fts.rowid = p.rowid
-        JOIN session s ON part_fts.session_id = s.id
         {where}
-        ORDER BY bm25(part_fts) ASC
+        {order_by}
         LIMIT ? OFFSET ?
         """,
-        (*params, limit, offset),
+        query_params,
     )
 
     results: list[dict] = []
     for row in rows:
-        # Parse the actual JSON data from the part table to extract type
-        # (the FTS index only stores plain text, not structured JSON).
-        parsed = parse_part_data(row["data"] or "{}")
-        text = sanitize_text(parsed.get("text", "") or "")
-        part_type = parsed.get("type", "unknown")
+        # The FTS table now stores all metadata including part_type.
+        text = row["fts_text"] or ""
+        part_type = row["part_type"] or "unknown"
 
         # Build snippet highlighting the first matched keyword.
         snippet = ""
@@ -385,12 +486,14 @@ def fetch_recall_results(
                 "session_id": row["session_id"],
                 "session_title": row["session_title"],
                 "session_slug": row["session_slug"],
+                "server": row["server"],
                 "directory": row["session_directory"],
                 "agent": row["agent"],
                 "part_id": row["part_id"],
-                "message_id": row["message_id"],
                 "time_created": format_timestamp(row["part_time_created"]),
                 "part_type": part_type,
+                "tool": row["tool"],
+                "title": row["title"],
                 "snippet": snippet or text[:200],
                 "full_text_length": len(text),
                 "bm25_score": row["bm25_score"],

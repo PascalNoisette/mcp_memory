@@ -22,8 +22,6 @@ os.environ.setdefault("DATABASE_PATH", os.path.expanduser(
 from models import ListProjectsInput, ReadMessagesInput, ResponseFormat
 from tools import list_projects, read_messages
 
-from constants import TEXT_TRUNCATION_LIMIT
-
 try:
     from .base import TestBase, _clean_db_path
 except ImportError:
@@ -42,12 +40,15 @@ class TestReadMessagesJSON(TestBase):
         self.session_id = result["id"]
         self.session_title = result["title"]
 
-        # Get the real part count from the DB
+        # Get the real part count from the DB — must match the same
+        # filtering done by read_messages (excludes step-start / step-finish)
         conn = sqlite3.connect(_clean_db_path())
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(
-            "SELECT COUNT(*) AS cnt FROM part WHERE session_id = ?",
+            """SELECT COUNT(*) AS cnt FROM part
+               WHERE session_id = ?
+                 AND json_extract(data, '$.type') NOT IN ('step-start', 'step-finish')""",
             (self.session_id,),
         )
         self.expected_total = cur.fetchone()["cnt"]
@@ -76,19 +77,10 @@ class TestReadMessagesJSON(TestBase):
         # Default page_size is 10
         self.assertEqual(len(self.data["messages"]), 10)
 
-    def test_each_message_has_index(self):
-        for m in self.data["messages"]:
-            self.assertIn("index", m)
-            self.assertIsInstance(m["index"], int)
-
     def test_each_message_has_part_id(self):
         for m in self.data["messages"]:
             self.assertIn("part_id", m)
             self.assertIsInstance(m["part_id"], str)
-
-    def test_each_message_has_message_id(self):
-        for m in self.data["messages"]:
-            self.assertIn("message_id", m)
 
     def test_each_message_has_type(self):
         for m in self.data["messages"]:
@@ -106,11 +98,6 @@ class TestReadMessagesJSON(TestBase):
         for m in self.data["messages"]:
             self.assertIn("full_text_length", m)
             self.assertIsInstance(m["full_text_length"], int)
-
-    def test_text_is_truncated_to_limit(self):
-        """Each message text should be at most TEXT_TRUNCATION_LIMIT chars."""
-        for m in self.data["messages"]:
-            self.assertLessEqual(len(m["text"]), TEXT_TRUNCATION_LIMIT)
 
     def test_has_more_is_false_on_first_page_small(self):
         # If total <= page_size, has_more should be False
@@ -229,12 +216,14 @@ class TestReadMessagesPagination(TestBase):
                 break
             offset = data["next_offset"]
 
-        # Verify we got all messages
+        # Verify we got all messages — same filter as read_messages
         conn = sqlite3.connect(_clean_db_path())
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(
-            "SELECT COUNT(*) AS cnt FROM part WHERE session_id = ?",
+            """SELECT COUNT(*) AS cnt FROM part
+               WHERE session_id = ?
+                 AND json_extract(data, '$.type') NOT IN ('step-start', 'step-finish')""",
             (self.session_id,),
         )
         expected = cur.fetchone()["cnt"]

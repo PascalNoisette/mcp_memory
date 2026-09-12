@@ -144,6 +144,29 @@ class RecallSessionInput(BaseModel):
             "Omit to search across all agents."
         ),
     )
+    server: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional server name to filter by. "
+            "Useful when multiple MCP instances share the same FTS index. "
+            "Omit to search across all servers."
+        ),
+    )
+    title: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional full-text search on part_fts.title. "
+            "Space-separated keywords are combined with OR logic. "
+            "When used, tool parts (type=tool) are NOT excluded from results."
+        ),
+    )
+    tool: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional exact-match filter on part_fts.tool. "
+            "When used, tool parts (type=tool) are NOT excluded from results."
+        ),
+    )
     limit: int = Field(
         default=DEFAULT_SEARCH_LIMIT,
         description=f"Maximum number of matching parts to return (1-{MAX_SEARCH_LIMIT})",

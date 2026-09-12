@@ -21,20 +21,30 @@ from typing import Any
 
 import pytest
 
-from database import parse_db_path
-
-# Point at the real database (opencode.db) with real sessions and messages.
-# Append ``:rw`` so that FTS5 init runs during tests (read-write mode).
+# Primary database path — always opened read-only (file:…?mode=ro URI).
+# The ``:rw`` suffix keeps FTS enabled (``is_db_readonly()`` returns False).
 os.environ.setdefault(
     "DATABASE_PATH",
     os.path.expanduser("~/.local/share/opencode/opencode.db") + ":rw",
 )
 
+# Isolated FTS database for tests.
+# Resolves to ``{primary_db_path}_test-fts.db`` — never touches the live
+# ``opencode_fts.db`` index.  The file is created at the start of the
+# session and removed at the end.
+os.environ.setdefault(
+    "FTS_DB_PATH",
+    os.path.expanduser("~/.local/share/opencode/opencode.db") + "_test-fts.db",
+)
+
+# SERVER_NAME is required in the new architecture
+os.environ.setdefault("SERVER_NAME", "memory")
+
 
 def _clean_db_path() -> str:
     """Return the raw database path without the ``:mode`` suffix."""
-    path, _ = parse_db_path(os.environ["DATABASE_PATH"])
-    return path
+    from database import resolve_db_path
+    return resolve_db_path()
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -128,7 +138,40 @@ def db_connection(db_path: str):
     conn.close()
 
 
-@pytest.fixture
-def run_async():
-    """Helper fixture to run async functions synchronously."""
-    return asyncio.run
+# ── FTS cleanup (runs after all tests in the session) ─────────────────────────
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Remove the test FTS database after the session ends.
+
+    This hook runs after all tests are collected and executed.  The
+    FTS database created during ``init_db()`` is deleted so that:
+
+      * Subsequent ``pytest`` runs start fresh (FTS gets recreated).
+      * The live ``opencode_fts.db`` is never modified.
+      * No manual cleanup is needed.
+    """
+    fts_path = os.environ.get("FTS_DB_PATH")
+    if fts_path:
+        import atexit
+
+        parent = os.path.dirname(fts_path)
+        if parent:
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except OSError:
+                pass
+
+        def _remove():
+            try:
+                if os.path.exists(fts_path):
+                    os.unlink(fts_path)
+                # Also clean up WAL/shm files
+                for suffix in ("-wal", "-shm"):
+                    wal = fts_path + suffix
+                    if os.path.exists(wal):
+                        os.unlink(wal)
+            except OSError:
+                pass
+
+        atexit.register(_remove)

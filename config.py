@@ -3,17 +3,22 @@
 Configuration for the Kilo Code MCP Memory Server.
 
 Centralizes all tunable constants and environment-based settings.
+
+Environment variables:
+    DATABASE_PATH  (required)    Primary opencode DB path.
+    SERVER_NAME    (required)    Unique tag for this MCP instance (e.g. 'prod', 'dev').
+    FTS_DB_PATH    (optional)   Shared FTS5 index path.
 """
 
 from __future__ import annotations
 
-# Database – import the shared resolver so all modules use the same
-# path (DATABASE_PATH env var or the default).  Test modules can still
-# override via ``os.environ.setdefault("DATABASE_PATH", ...)`` before
-# this module is imported.
-from database import resolve_db_path
+from database import resolve_db_path, resolve_fts_db_path
 
 DATABASE_PATH: str = resolve_db_path()
+FTS_DB_PATH: str = resolve_fts_db_path()
+
+# FTS sync (seconds between background sync cycles)
+INTERVAL_SYNC: int = 30
 
 # Pagination / search limits
 DEFAULT_PAGE_SIZE: int = 10        # default messages per page

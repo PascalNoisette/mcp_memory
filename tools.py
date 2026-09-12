@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from database import init_db, resolve_db_path
+from database import init_db
 
 init_db()
 
@@ -189,6 +189,9 @@ def recall_session(
     keywords: str,
     directory: Optional[str] = None,
     agent: Optional[str] = None,
+    server: Optional[str] = None,
+    title: Optional[str] = None,
+    tool: Optional[str] = None,
     limit: int = 20,
     offset: int = 0,
     response_format: str = "markdown",
@@ -206,13 +209,9 @@ def recall_session(
     expensive agent.  Use ``agent`` to filter by agent type and
     ``directory`` to scope to a specific project.
 
-    Use cases:
-      - Find what an explorer agent already discovered about a file or
-        pattern in this project.
-      - Retrieve the full conversation from a prior session to read a
-        detailed analysis.
-      - Check what another agent has already worked on before duplicating
-        effort.
+    When multiple MCP instances share the same FTS index, use the
+    ``server`` parameter to filter results to a specific instance's
+    database.
 
     Note: Results may include matches from the current session.
 
@@ -220,6 +219,12 @@ def recall_session(
         keywords: Space-separated keywords to search for in message content.
         directory: Optional directory path to scope the search to a single project.
         agent: Optional agent type to filter by (e.g. 'explorer', 'general', 'camofox').
+        server: Optional server name to filter by (useful when multiple MCP
+                instances share the same FTS index).
+        title: Optional full-text search on part title. When used, tool
+               parts are NOT excluded from results.
+        tool: Optional exact-match filter on part tool. When used, tool
+              parts are NOT excluded from results.
         limit: Maximum number of matching parts to return.
         offset: Number of results to skip for pagination.
         response_format: Output format ('markdown' or 'json').
@@ -232,10 +237,10 @@ def recall_session(
 
     try:
         total_matches, total_sessions = fetch_recall_stats(
-            directory, keywords_list, agent
+            directory, keywords_list, agent, server, title, tool
         )
         matches = fetch_recall_results(
-            directory, keywords_list, limit, offset, agent
+            directory, keywords_list, limit, offset, agent, server, title, tool
         )
         return format_recall(
             keywords=keywords_list,

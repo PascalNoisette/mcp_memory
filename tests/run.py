@@ -15,6 +15,20 @@ import sys
 # regardless of whether this script is run from the project root or elsewhere.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# ── Environment variables required by the app ──────────────────────────
+# These must match the values in base.py and conftest.py so that
+# all test files (whether they import base.py or not) share the
+# same SERVER_NAME and never touch the live opencode_fts.db index.
+os.environ.setdefault("SERVER_NAME", "memory")
+os.environ.setdefault(
+    "DATABASE_PATH",
+    os.path.expanduser("~/.local/share/opencode/opencode.db") + ":rw",
+)
+os.environ.setdefault(
+    "FTS_DB_PATH",
+    os.path.expanduser("~/.local/share/opencode/opencode.db") + "_test-fts.db",
+)
+
 import unittest
 
 if __name__ == "__main__":

@@ -14,25 +14,34 @@ import sqlite3
 import unittest
 from typing import Any, Callable, Optional
 
-from database import parse_db_path
+# ── Environment ────────────────────────────────────────────────────────
 
-# ── Environment ────────────────────────────────────────────────────────────────
-
-# Point at the real database (opencode.db) with real sessions and messages.
-# Append ``:rw`` so that FTS5 init runs during tests (read-write mode).
+# Primary database path — always opened read-only (file:…?mode=ro URI).
+# The ``:rw`` suffix keeps FTS enabled (``is_db_readonly()`` returns False).
 os.environ.setdefault(
     "DATABASE_PATH",
     os.path.expanduser("~/.local/share/opencode/opencode.db") + ":rw",
 )
 
+# Isolated FTS database for tests — never touches the live
+# ``opencode_fts.db`` index.  The file is created at the start of the
+# session and removed at the end by ``conftest.py``.
+os.environ.setdefault(
+    "FTS_DB_PATH",
+    os.path.expanduser("~/.local/share/opencode/opencode.db") + "_test-fts.db",
+)
 
-# ── DB path helper ─────────────────────────────────────────────────────────────
+# SERVER_NAME is required in the new architecture
+os.environ.setdefault("SERVER_NAME", "memory")
+
+
+# ── DB path helper ─────────────────────────────────────────────────────
 
 
 def _clean_db_path() -> str:
     """Return the raw database path without the ``:mode`` suffix."""
-    path, _ = parse_db_path(os.environ["DATABASE_PATH"])
-    return path
+    from database import resolve_db_path
+    return resolve_db_path()
 
 
 # ── Tool runner ────────────────────────────────────────────────────────────────
@@ -125,6 +134,12 @@ class TestBase(unittest.TestCase):
     """Base class providing shared helpers to all test classes."""
 
     _call_tool = staticmethod(_call_tool)
+
+    def setUp(self) -> None:
+        """Ensure database & FTS are initialised before each test."""
+        from database import init_db
+
+        init_db()
 
     @staticmethod
     def get_directories() -> list[str]:

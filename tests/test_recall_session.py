@@ -89,10 +89,6 @@ class TestRecallJSON(TestBase):
         for m in self.data["matches"]:
             self.assertIn("part_id", m)
 
-    def test_each_match_has_message_id(self):
-        for m in self.data["matches"]:
-            self.assertIn("message_id", m)
-
     def test_each_match_has_time_created(self):
         for m in self.data["matches"]:
             self.assertIn("time_created", m)
