@@ -344,6 +344,162 @@ def _build_fts_where_clause(
     return "WHERE " + " AND ".join(parts), params
 
 
+def _search_with_retry(
+    directory: Optional[str],
+    keywords: list[str],
+    agent: Optional[str],
+    server: Optional[str],
+    title: Optional[str],
+    tool: Optional[str],
+    limit: int,
+    offset: int,
+    stats: bool = False,
+    max_attempts: int = 1000,
+) -> Any:
+    """Search the FTS index with automatic keyword reduction on empty results.
+
+    When the full keyword set returns zero matches, progressively drop the
+    last keyword and retry (e.g. ``"a b c"`` → ``"a b"`` → ``"a"``).
+    This mitigates BM25 over-specification: a query like
+    ``"systemd service unit install daemon"`` may match nothing, but
+    ``"systemd service"`` or even ``"systemd"`` alone may find results.
+
+    The phrase bonus (``instr()`` boosting) is always computed from the
+    **original** keyword set so that partial matches still benefit from
+    it when the full phrase appears in the text.
+
+    Args:
+        directory, agent, server, title, tool: FTS filter parameters.
+        keywords: Keyword list — reduced iteratively on empty results.
+        limit: Max rows to return (ignored for stats mode).
+        offset: Pagination offset.
+        stats: If True, return ``(total_matches, total_sessions)``.
+        max_attempts: Safety cap to avoid infinite loops.
+
+    Returns:
+        *stats=True* → ``(total_matches, total_sessions)``
+        *stats=False* → list of result dicts
+    """
+    # Compute phrase text from the original keywords once (used by instr()
+    # in the ORDER BY to boost exact-phrase matches regardless of which
+    # reduced keyword set was tried).
+    phrase_text: Optional[str] = (
+        " ".join(keywords) if len(keywords) >= 2 else None
+    )
+
+    for attempt in range(max_attempts):
+        reduced = keywords[: len(keywords) - attempt] if attempt > 0 else keywords
+        if not reduced:
+            # All keywords exhausted — fall back to a no-op (empty result).
+            if stats:
+                return 0, 0
+            return []
+
+        where, params = _build_fts_where_clause(
+            directory, reduced, agent, server, title, tool
+        )
+
+        if stats:
+            row = _query_fts(
+                f"""
+                SELECT COUNT(*) as matches,
+                       COUNT(DISTINCT session_id) as sessions
+                FROM part_fts
+                {where}
+                """,
+                params,
+                fetch_all=False,
+            )
+            if row:
+                return row["matches"], row["sessions"]
+            continue
+
+        # Build ORDER BY — use phrase_text from the *original* keywords,
+        # not from the reduced set.
+        if phrase_text:
+            order_by = (
+                "ORDER BY bm25(part_fts) "
+                "- CASE WHEN instr(part_fts.text, ?) > 0 THEN 3.0 "
+                "ELSE 0.0 END ASC"
+            )
+            query_params: tuple = (*params, phrase_text, limit, offset)
+        else:
+            order_by = "ORDER BY bm25(part_fts) ASC"
+            query_params = (*params, limit, offset)
+
+        rows = _query_fts(
+            f"""
+            SELECT
+                part_fts.session_id,
+                part_fts.text    AS fts_text,
+                part_fts.session_slug      AS session_slug,
+                part_fts.session_title     AS session_title,
+                part_fts.server            AS server,
+                part_fts.session_time_created   AS session_time_created,
+                part_fts.directory         AS session_directory,
+                part_fts.agent,
+                part_fts.part_id           AS part_id,
+                part_fts.part_type         AS part_type,
+                part_fts.part_time_created AS part_time_created,
+                part_fts.tool              AS tool,
+                part_fts.title             AS title,
+                ROUND(bm25(part_fts), 2)   AS bm25_score
+            FROM part_fts
+            {where}
+            {order_by}
+            LIMIT ? OFFSET ?
+            """,
+            query_params,
+        )
+
+        # If results found, build and return snippets immediately.
+        if rows:
+            results: list[dict] = []
+            for row in rows:
+                text = row["fts_text"] or ""
+                part_type = row["part_type"] or "unknown"
+
+                # Build snippet highlighting the first matched keyword.
+                snippet = ""
+                for kw in reduced:
+                    if kw.lower() in text.lower():
+                        snippet = highlight_match(text, kw)
+                        break
+                if not snippet:
+                    snippet = text[:200]
+
+                results.append(
+                    {
+                        "session_id": row["session_id"],
+                        "session_title": row["session_title"],
+                        "session_slug": row["session_slug"],
+                        "server": row["server"],
+                        "directory": row["session_directory"],
+                        "agent": row["agent"],
+                        "part_id": row["part_id"],
+                        "time_created": format_timestamp(
+                            row["part_time_created"]
+                        ),
+                        "part_type": part_type,
+                        "tool": row["tool"],
+                        "title": row["title"],
+                        "snippet": snippet or text[:200],
+                        "full_text_length": len(text),
+                        "bm25_score": row["bm25_score"],
+                    }
+                )
+            return results
+
+        # No results — next iteration will drop one more keyword.
+        # (The for-loop handles this automatically.)
+
+    # Should never reach here with max_attempts >= len(keywords),
+    # but safeguard anyway.
+    if stats:
+        return 0, 0
+    return []
+
+
 def fetch_recall_stats(
     directory: Optional[str],
     keywords: list[str],
@@ -360,35 +516,17 @@ def fetch_recall_stats(
     All queries run against the FTS table only — no JOIN to the primary
     database is needed because all metadata is stored in the FTS index.
 
+    Automatically retries with fewer keywords when no matches are found,
+    progressively dropping the last keyword until results appear or all
+    keywords are exhausted.
+
     Raises:
         FTSUnavailableError: If the full-text search table is not available.
     """
     _ensure_fts_available()
-    where, params = _build_fts_where_clause(directory, keywords, agent, server, title, tool)
-
-    row = _query_fts(
-        f"""
-        SELECT COUNT(DISTINCT part_fts.session_id)
-        FROM part_fts
-        {where}
-        """,
-        params,
-        fetch_all=False,
+    return _search_with_retry(
+        directory, keywords, agent, server, title, tool, 0, 0, stats=True
     )
-    total_sessions = row[0] if row else 0
-
-    row = _query_fts(
-        f"""
-        SELECT COUNT(*)
-        FROM part_fts
-        {where}
-        """,
-        params,
-        fetch_all=False,
-    )
-    total_matches = row[0] if row else 0
-
-    return total_matches, total_sessions
 
 
 def fetch_recall_results(
@@ -410,93 +548,15 @@ def fetch_recall_results(
     part_id) is stored directly in the FTS table — no JOIN to the primary
     database is needed.
 
+    Automatically retries with fewer keywords when no matches are found,
+    progressively dropping the last keyword until results appear or all
+    keywords are exhausted.
+
     Raises:
         FTSUnavailableError: If the full-text search table is not available.
     """
     _ensure_fts_available()
-    where, params = _build_fts_where_clause(directory, keywords, agent, server, title, tool)
-
-    # Build exact-phrase text for `instr()` phrase boosting.
-    # Only apply phrase boosting when 2+ keywords are provided —
-    # a phrase requires at least two words to be meaningful.
-    phrase_text: Optional[str] = None
-    if len(keywords) >= 2:
-        phrase_text = ' '.join(keywords)
-
-    # Conditionally build ORDER BY with phrase bonus.
-    # The CASE subtracts 3.0 from bm25 when the row also contains
-    # the exact phrase, making it more negative = higher rank.
-    # We use `instr()` (not FTS5 MATCH) because SQLite does not
-    # allow the MATCH operator inside CASE expressions.
-    # Phrase param must be placed *before* LIMIT/OFFSET in the
-    # params tuple because it is used as a ? placeholder in ORDER BY.
-    if phrase_text:
-        order_by = (
-            "ORDER BY bm25(part_fts) "
-            "- CASE WHEN instr(part_fts.text, ?) > 0 THEN 3.0 "
-            "ELSE 0.0 END ASC"
-        )
-        query_params: tuple = (*params, phrase_text, limit, offset)
-    else:
-        order_by = "ORDER BY bm25(part_fts) ASC"
-        query_params = (*params, limit, offset)
-
-    rows = _query_fts(
-        f"""
-        SELECT
-            part_fts.session_id,
-            part_fts.text    AS fts_text,
-            part_fts.session_slug      AS session_slug,
-            part_fts.session_title     AS session_title,
-            part_fts.server            AS server,
-            part_fts.session_time_created   AS session_time_created,
-            part_fts.directory         AS session_directory,
-            part_fts.agent,
-            part_fts.part_id           AS part_id,
-            part_fts.part_type         AS part_type,
-            part_fts.part_time_created AS part_time_created,
-            part_fts.tool              AS tool,
-            part_fts.title             AS title,
-            ROUND(bm25(part_fts), 2)   AS bm25_score
-        FROM part_fts
-        {where}
-        {order_by}
-        LIMIT ? OFFSET ?
-        """,
-        query_params,
+    return _search_with_retry(
+        directory, keywords, agent, server, title, tool, limit, offset,
+        stats=False,
     )
-
-    results: list[dict] = []
-    for row in rows:
-        # The FTS table now stores all metadata including part_type.
-        text = row["fts_text"] or ""
-        part_type = row["part_type"] or "unknown"
-
-        # Build snippet highlighting the first matched keyword.
-        snippet = ""
-        for kw in keywords:
-            if kw.lower() in text.lower():
-                snippet = highlight_match(text, kw)
-                break
-        if not snippet:
-            snippet = text[:200]
-
-        results.append(
-            {
-                "session_id": row["session_id"],
-                "session_title": row["session_title"],
-                "session_slug": row["session_slug"],
-                "server": row["server"],
-                "directory": row["session_directory"],
-                "agent": row["agent"],
-                "part_id": row["part_id"],
-                "time_created": format_timestamp(row["part_time_created"]),
-                "part_type": part_type,
-                "tool": row["tool"],
-                "title": row["title"],
-                "snippet": snippet or text[:200],
-                "full_text_length": len(text),
-                "bm25_score": row["bm25_score"],
-            }
-        )
-    return results
