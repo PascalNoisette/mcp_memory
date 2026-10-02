@@ -3,10 +3,13 @@
 Unit tests for FTS filtering and new column output.
 
 Tests:
-  1. ``step-start`` and ``step-finish`` part types are NOT stored in the FTS index.
-  2. The FTS columns ``server``, ``tool``, ``title`` appear in recall JSON output.
+  1. Rows with ``type`` NOT IN ('user', 'assistant') (e.g. step-start,
+     step-finish) are NOT stored in the FTS index.
+  2. The FTS columns ``server``, ``tool``, ``title`` appear in recall
+     JSON output.
   3. The ``server`` field appears in recall Markdown session headers.
-  4. The ``tool`` and ``title`` fields appear in recall Markdown result lines.
+  4. The ``tool`` and ``title`` fields appear in recall Markdown result
+     lines.
 """
 
 from __future__ import annotations
@@ -49,10 +52,10 @@ def _make_test_db() -> tuple[str, sqlite3.Connection, sqlite3.Connection]:
     _ensure_fts_schema(fts_conn)
     fts_conn.commit()
 
-    # Minimal primary DB schema
+    # Minimal primary DB schema (v2)
     primary.execute(
         """
-        CREATE TABLE IF NOT EXISTS session (
+        CREATE TABLE IF NOT EXISTS session_v2 (
             id          TEXT PRIMARY KEY,
             directory   TEXT,
             agent       TEXT,
@@ -65,11 +68,11 @@ def _make_test_db() -> tuple[str, sqlite3.Connection, sqlite3.Connection]:
     )
     primary.execute(
         """
-        CREATE TABLE IF NOT EXISTS part (
+        CREATE TABLE IF NOT EXISTS session_message (
             rowid        INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id   TEXT NOT NULL,
-            message_id   TEXT,
             id           TEXT,
+            type         TEXT NOT NULL,
             time_created INTEGER,
             time_updated INTEGER,
             data         TEXT
@@ -88,7 +91,7 @@ def _insert_session(
 ) -> None:
     """Insert a session row into the primary DB."""
     primary.execute(
-        "INSERT OR REPLACE INTO session (id, directory, agent, title, slug, time_created, project_id) "
+        "INSERT OR REPLACE INTO session_v2 (id, directory, agent, title, slug, time_created, project_id) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             session_id,
@@ -111,14 +114,21 @@ def _insert_part(
     time_created: int,
     data: dict,
 ) -> int:
-    """Insert a part row. Returns the rowid."""
+    """Insert a session_message row. Returns the rowid.
+
+    The ``data`` dict must contain a ``"type"`` key that will be written
+    to the ``session_message.type`` column (required for v2 schema
+    type-filtering).  The ``message_id`` / ``part_id`` parameters are
+    both stored into the ``session_message.id`` column (the real v2
+    schema has a single ``id`` column that serves as the message ID).
+    """
     cur = primary.execute(
-        "INSERT INTO part (session_id, message_id, id, time_created, data) "
+        "INSERT INTO session_message (session_id, id, type, time_created, data) "
         "VALUES (?, ?, ?, ?, ?)",
         (
             session_id,
             message_id,
-            part_id,
+            data.get("type", "user"),
             time_created,
             json.dumps(data),
         ),
@@ -129,37 +139,41 @@ def _insert_part(
 
 def _perform_full_sync(primary: sqlite3.Connection, fts_conn: sqlite3.Connection, server: str) -> int:
     """Run the same logic that ``_do_fts_init(server)`` uses — insert all
-    eligible parts into the FTS table for *server*, then return the count.
+    eligible session_message rows into the FTS table for *server*, then
+    return the count.
 
-    This mirrors the exact filtering rules: skip ``step-start``, ``step-finish``,
-    rows with no text/content/value/state.output, and rows with invalid JSON.
+    This mirrors the exact v2 filtering rules: only ``user`` / ``assistant``
+    types are indexed (the ``type`` column on ``session_message``), skip
+    rows with invalid JSON, and require at least one of ``$.text``,
+    ``$.content``, ``$.value``, ``$.state.output`` to be present.
     """
     from formatters import parse_part_data
 
     cur = primary.cursor()
     cur.execute(
         """
-        SELECT p.rowid, p.data, p.session_id, p.message_id,
-               p.id              AS part_id,
-               s.directory,
-               s.agent,
-               s.title           AS session_title,
-               s.slug            AS session_slug,
-               s.time_created    AS session_time_created,
-               p.time_created    AS part_time_created,
-               json_extract(p.data, '$.tool') AS part_tool,
-               json_extract(p.data, '$.state.title') AS part_title
-        FROM part p
-        JOIN session s ON p.session_id = s.id
-        WHERE json_valid(p.data) = 1
-          AND json_extract(p.data, '$.type') NOT IN ('step-start', 'step-finish')
+        SELECT sm.id AS data_rowid, sm.data, sm.session_id,
+               sm.id              AS message_id,
+               sm.id              AS part_id,
+               sv.directory,
+               sv.agent,
+               sv.title           AS session_title,
+               sv.slug            AS session_slug,
+               sv.time_created    AS session_time_created,
+               sm.time_created    AS part_time_created,
+               NULL               AS part_tool,
+               NULL               AS part_title
+        FROM session_message sm
+        JOIN session_v2 sv ON sm.session_id = sv.id
+        WHERE json_valid(sm.data) = 1
+          AND sm.type IN ('user', 'assistant')
           AND (
-              json_extract(p.data, '$.text') IS NOT NULL
-              OR json_extract(p.data, '$.content') IS NOT NULL
-              OR json_extract(p.data, '$.value') IS NOT NULL
-              OR json_extract(p.data, '$.state.output') IS NOT NULL
+              json_extract(sm.data, '$.text') IS NOT NULL
+              OR json_extract(sm.data, '$.content') IS NOT NULL
+              OR json_extract(sm.data, '$.value') IS NOT NULL
+              OR json_extract(sm.data, '$.state.output') IS NOT NULL
           )
-        ORDER BY p.rowid ASC
+        ORDER BY sm.id ASC
         """
     )
     rows = cur.fetchall()
@@ -170,12 +184,12 @@ def _perform_full_sync(primary: sqlite3.Connection, fts_conn: sqlite3.Connection
         part_type = parsed.get("type", "unknown")
         fts_conn.execute(
             """INSERT INTO part_fts
-               (rowid, text, session_id, message_id, part_id, server,
+               (data_rowid, text, session_id, message_id, part_id, server,
                 part_type, directory, agent, session_title, session_slug,
                 session_time_created, part_time_created, tool, title)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                row["rowid"],
+                row["data_rowid"],
                 text,
                 row["session_id"],
                 row["message_id"],
@@ -241,7 +255,8 @@ class TestStepStartFinishExcludedFromFts(unittest.TestCase):
 
             count = _perform_full_sync(primary, fts_conn, "step-test")
 
-            # Total parts in FTS should be 0 (both are excluded)
+            # Total parts in FTS should be 0 (both are excluded because
+            # sm.type is NOT IN ('user', 'assistant'))
             self.assertEqual(count, 0)
 
             step_start_in_fts = fts_conn.execute(
@@ -287,7 +302,12 @@ class TestStepStartFinishExcludedFromFts(unittest.TestCase):
             fts_conn.close()
 
     def test_regular_parts_still_synced_with_step_parts(self):
-        """Regular (non-step) parts should still be synced even when step parts are present."""
+        """Regular (user / assistant) parts should still be synced even when
+        step parts are present.
+
+        The v2 schema filters by ``sm.type IN ('user', 'assistant')``, so
+        only rows with those exact type values are indexed.
+        """
         _, primary, fts_conn = self._setup_db()
         try:
             _insert_session(primary)
@@ -297,7 +317,7 @@ class TestStepStartFinishExcludedFromFts(unittest.TestCase):
                 "msg-user",
                 "part-user",
                 500,
-                {"type": "user_message", "text": "Hello world"},
+                {"type": "user", "text": "Hello world"},
             )
             _insert_part(
                 primary,
@@ -313,7 +333,7 @@ class TestStepStartFinishExcludedFromFts(unittest.TestCase):
                 "msg-agent",
                 "part-agent",
                 1500,
-                {"type": "agent_message", "text": "Answer"},
+                {"type": "assistant", "text": "Answer"},
             )
             _insert_part(
                 primary,
@@ -326,7 +346,7 @@ class TestStepStartFinishExcludedFromFts(unittest.TestCase):
 
             count = _perform_full_sync(primary, fts_conn, "step-test")
 
-            # Only user_message and agent_message should be indexed
+            # Only user and assistant should be indexed (not step-start/step-finish)
             self.assertEqual(count, 2)
 
             # Verify the regular parts exist
@@ -397,7 +417,7 @@ class TestStepStartFinishExcludedFromFts(unittest.TestCase):
                 "msg-user",
                 "part-user",
                 500,
-                {"type": "user_message", "text": "Hello world"},
+                {"type": "user", "text": "Hello world"},
             )
 
             _perform_full_sync(primary, fts_conn, "step-test")
@@ -408,9 +428,9 @@ class TestStepStartFinishExcludedFromFts(unittest.TestCase):
             ).fetchone()[0]
             self.assertEqual(result, 0)
 
-            # But user_message should exist
+            # But 'user' should exist
             user_count = fts_conn.execute(
-                "SELECT COUNT(*) FROM part_fts WHERE part_type = 'user_message'"
+                "SELECT COUNT(*) FROM part_fts WHERE part_type = 'user'"
             ).fetchone()[0]
             self.assertEqual(user_count, 1)
         finally:

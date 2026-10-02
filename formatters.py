@@ -59,32 +59,60 @@ def format_timestamp(ts: Optional[int | str], default: str = "unknown") -> str:
         return default
 
 
-def parse_part_data(raw_data: str) -> dict[str, Any]:
-    """Parse the JSON data field from a part row.
+def _extract_text_from_content_array(content: list[dict[str, Any]]) -> str:
+    """Extract text from a ``content`` array (assistant messages).
 
-    Returns a dict with ``type`` and ``text`` keys.  On parse failure a safe
+    Assistant messages store their content in a ``content`` array with
+    parts of different types (``"text"``, ``"reasoning"``, ``"tool"``,
+    etc.).  This function extracts the ``text`` from each part,
+    filtering out tool-call parts (which don't have meaningful text)
+    and concatenating the rest.
+
+    Returns:
+        Sanitised text, or empty string if no extractable text is found.
+    """
+    parts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type", "")
+        text = part.get("text", "")
+        # Skip tool-call parts (their ``text`` is metadata, not content).
+        if part_type == "tool":
+            continue
+        if isinstance(text, str) and text.strip():
+            parts.append(text)
+    full = "\n".join(parts)
+    return sanitize_text(full) if full else ""
+
+
+def parse_part_data(raw_data: str) -> dict[str, Any]:
+    """Parse the JSON data field from a session_message row.
+
+    Returns a dict with ``text`` key.  On parse failure a safe
     fallback dict is returned so callers never crash.
     Binary / control characters are stripped from the text value.
+
+    **Assistant messages** have their text stored in a ``content``
+    array (``[{"type": "text", "text": "..."}, ...]``).  When a
+    top-level ``text`` key is absent, the function falls back to
+    extracting text from this array.
     """
     try:
         parsed = json.loads(raw_data)
         if isinstance(parsed, dict):
+            # --- User-like message: flat ``text`` field ---
             if "text" in parsed and isinstance(parsed["text"], str):
                 parsed["text"] = sanitize_text(parsed["text"])
-            # For tool-type parts, extract the output from state.output
-            # since tools do not have a top-level "text" field.
-            if parsed.get("type") == "tool" and not parsed.get("text"):
-                state = parsed.get("state") or {}
-                output = state.get("output")
-                if isinstance(output, str) and output:
-                    parsed["text"] = output
-                elif isinstance(output, dict):
-                    parsed["text"] = json.dumps(output)
+            # --- Assistant-like message: ``content`` array ---
+            elif "content" in parsed and isinstance(parsed["content"], list):
+                parsed["text"] = _extract_text_from_content_array(
+                    parsed["content"]
+                )
             return parsed
-        return {"type": "unknown", "text": sanitize_text(str(parsed))}
+        return {"text": sanitize_text(str(parsed))}
     except (json.JSONDecodeError, TypeError):
         return {
-            "type": "parse_error",
             "text": sanitize_text(raw_data),
         }
 

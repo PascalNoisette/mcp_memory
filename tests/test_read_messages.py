@@ -41,14 +41,14 @@ class TestReadMessagesJSON(TestBase):
         self.session_title = result["title"]
 
         # Get the real part count from the DB — must match the same
-        # filtering done by read_messages (excludes step-start / step-finish)
+        # filtering done by read_messages (excludes idle / non-conversation rows)
         conn = sqlite3.connect(_clean_db_path())
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(
-            """SELECT COUNT(*) AS cnt FROM part
+            """SELECT COUNT(*) AS cnt FROM session_message
                WHERE session_id = ?
-                 AND json_extract(data, '$.type') NOT IN ('step-start', 'step-finish')""",
+                 AND type IN ('user', 'assistant')""",
             (self.session_id,),
         )
         self.expected_total = cur.fetchone()["cnt"]
@@ -221,9 +221,9 @@ class TestReadMessagesPagination(TestBase):
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(
-            """SELECT COUNT(*) AS cnt FROM part
+            """SELECT COUNT(*) AS cnt FROM session_message
                WHERE session_id = ?
-                 AND json_extract(data, '$.type') NOT IN ('step-start', 'step-finish')""",
+                 AND type IN ('user', 'assistant')""",
             (self.session_id,),
         )
         expected = cur.fetchone()["cnt"]

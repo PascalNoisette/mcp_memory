@@ -44,7 +44,7 @@ class ListProjectsInput(BaseModel):
     """Input parameters for the ``list_projects`` tool.
 
     Lists projects derived from session directory grouping:
-    ``SELECT directory, COUNT(*) FROM session GROUP BY directory``.
+    ``SELECT directory, COUNT(*) FROM session_v2 GROUP BY directory``.
     """
 
     model_config = _MODEL_CONFIG

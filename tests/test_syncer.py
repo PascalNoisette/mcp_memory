@@ -37,17 +37,17 @@ def _create_primary_db(
     session_id: str = "sess-001",
     parts: list[dict] | None = None,
 ) -> sqlite3.Connection:
-    """Create a temporary primary database with *session* and *part* tables.
+    """Create a temporary primary database with *session_v2* and *session_message* tables.
 
     Parameters
     ----------
     path :
         Filesystem path for the temporary database file.
     session_id :
-        A session ID to insert into the ``session`` table.
+        A session ID to insert into the ``session_v2`` table.
     parts :
-        List of dicts with keys ``message_id``, ``time_created``, ``data``.
-        Each entry becomes a row in the ``part`` table.
+        List of dicts with keys ``message_id``, ``time_created``, ``type``, ``data``.
+        Each entry becomes a row in the ``session_message`` table.
     """
     if parts is None:
         parts = []
@@ -57,7 +57,7 @@ def _create_primary_db(
 
     # ── Schema ──────────────────────────────────────────────────────────
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS session (
+        CREATE TABLE IF NOT EXISTS session_v2 (
             id              TEXT PRIMARY KEY,
             directory       TEXT,
             agent           TEXT,
@@ -67,11 +67,11 @@ def _create_primary_db(
         )
     """)
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS part (
+        CREATE TABLE IF NOT EXISTS session_message (
             rowid           INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id      TEXT NOT NULL,
-            message_id      TEXT,
             id              TEXT,
+            type            TEXT NOT NULL,
             time_created    INTEGER,
             time_updated    INTEGER,
             data            TEXT
@@ -80,19 +80,20 @@ def _create_primary_db(
 
     # ── Seed data ───────────────────────────────────────────────────────
     cur.execute(
-        "INSERT INTO session (id, directory, agent, title, slug, time_created) "
+        "INSERT INTO session_v2 (id, directory, agent, title, slug, time_created) "
         "VALUES (?, ?, ?, ?, ?, ?)",
         (session_id, "/test/dir", "general", "Test Session", "test-session", 1000),
     )
 
     for i, part in enumerate(parts):
         cur.execute(
-            "INSERT INTO part (session_id, message_id, time_created, data) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO session_message (session_id, id, time_created, type, data) "
+            "VALUES (?, ?, ?, ?, ?)",
             (
                 session_id,
                 part.get("message_id", f"msg-{i}"),
                 part.get("time_created", 1000 + i),
+                part.get("type", "user"),
                 part.get("data", "{}"),
             ),
         )
@@ -155,22 +156,25 @@ def fts_conn_with_watermarks(db_paths):
 
 @pytest.fixture()
 def primary_with_parts(db_paths):
-    """Primary DB seeded with three parts (rowids 1, 2, 3)."""
+    """Primary DB seeded with three session_message rows (rowids 1, 2, 3)."""
     parts = [
         {
             "message_id": "msg-1",
             "time_created": 1000,
-            "data": json.dumps({"type": "user_message", "text": "first message"}),
+            "type": "user",
+            "data": json.dumps({"text": "first message"}),
         },
         {
             "message_id": "msg-2",
             "time_created": 1500,
-            "data": json.dumps({"type": "agent_message", "text": "second message"}),
+            "type": "assistant",
+            "data": json.dumps({"text": "second message"}),
         },
         {
             "message_id": "msg-3",
             "time_created": 2000,
-            "data": json.dumps({"type": "user_message", "text": "third message"}),
+            "type": "user",
+            "data": json.dumps({"text": "third message"}),
         },
     ]
     conn = _create_primary_db(db_paths[0], parts=parts)
@@ -184,11 +188,13 @@ def primary_with_invalid_json(db_paths):
         {
             "message_id": "msg-1",
             "time_created": 1000,
-            "data": json.dumps({"type": "user_message", "text": "valid json"}),
+            "type": "user",
+            "data": json.dumps({"text": "valid json"}),
         },
         {
             "message_id": "msg-2",
             "time_created": 1500,
+            "type": "user",
             "data": "NOT VALID JSON AT ALL {{{",
         },
     ]
@@ -198,22 +204,25 @@ def primary_with_invalid_json(db_paths):
 
 @pytest.fixture()
 def primary_with_empty_parts(db_paths):
-    """Primary DB with parts that have NULL/empty/invalid data fields."""
+    """Primary DB with session_message rows that have NULL/empty/invalid data fields."""
     parts = [
         {
             "message_id": "msg-empty",
             "time_created": 1000,
+            "type": "user",
             "data": "",  # empty string → not valid JSON
         },
         {
             "message_id": "msg-null",
             "time_created": 1500,
+            "type": "user",
             "data": None,  # NULL
         },
         {
             "message_id": "msg-no-field",
             "time_created": 2000,
-            "data": json.dumps({"type": "user_message"}),  # no text/content/value
+            "type": "user",
+            "data": json.dumps({}),  # no text/content/value
         },
     ]
     conn = _create_primary_db(db_paths[0], parts=parts)
@@ -222,29 +231,32 @@ def primary_with_empty_parts(db_paths):
 
 @pytest.fixture()
 def primary_with_new_row(db_paths):
-    """Primary DB with three parts, then a fourth row (rowid=4) inserted after."""
+    """Primary DB with three session_message rows, then a fourth row (rowid=4) inserted after."""
     conn = _create_primary_db(db_paths[0], parts=[
         {
             "message_id": "msg-1",
             "time_created": 1000,
-            "data": json.dumps({"type": "user_message", "text": "first"}),
+            "type": "user",
+            "data": json.dumps({"text": "first"}),
         },
         {
             "message_id": "msg-2",
             "time_created": 1500,
-            "data": json.dumps({"type": "agent_message", "text": "second"}),
+            "type": "assistant",
+            "data": json.dumps({"text": "second"}),
         },
         {
             "message_id": "msg-3",
             "time_created": 2000,
-            "data": json.dumps({"type": "user_message", "text": "third"}),
+            "type": "user",
+            "data": json.dumps({"text": "third"}),
         },
     ])
     # Insert a new row *after* the fixture sets up watermarks
     conn.execute(
-        "INSERT INTO part (session_id, message_id, time_created, data) "
-        "VALUES ('sess-001', 'msg-new', 2500, ?)",
-        (json.dumps({"type": "agent_message", "text": "new row synced"}),),
+        "INSERT INTO session_message (session_id, id, time_created, type, data) "
+        "VALUES ('sess-001', 'msg-new', 2500, 'assistant', ?)",
+        (json.dumps({"text": "new row synced"}),),
     )
     conn.commit()
     return conn
@@ -252,18 +264,19 @@ def primary_with_new_row(db_paths):
 
 @pytest.fixture()
 def primary_with_binary_data(db_paths):
-    """Primary DB with a part containing binary / null bytes."""
+    """Primary DB with a session_message containing binary / null bytes."""
     parts = [
         {
             "message_id": "msg-1",
             "time_created": 1000,
-            "data": json.dumps({"type": "user_message", "text": "clean text"}),
+            "type": "user",
+            "data": json.dumps({"text": "clean text"}),
         },
         {
             "message_id": "msg-binary",
             "time_created": 1500,
+            "type": "assistant",
             "data": json.dumps({
-                "type": "agent_message",
                 "text": "contains\x00null\x01bytes\x1fhere",
             }),
         },
@@ -416,7 +429,7 @@ class TestIncrementalSync:
     def test_no_new_rows_returns_zero(self, db_paths, primary_with_parts, fts_conn_with_watermarks):
         """Watermarks are inclusive — rows with ts > last_ts OR rowid > last_rid are synced.
 
-        The primary_with_parts fixture creates parts at rowids 1, 2, 3
+        The primary_with_parts fixture creates session_message at rowids 1, 2, 3
         with timestamps 1000, 1500, 2000. Watermarks are ts=1000, rid=2.
         Due to the OR condition (rowid > 2 OR time > 1000):
           - rowid=1 (ts=1000): neither condition met → skipped
@@ -432,7 +445,8 @@ class TestIncrementalSync:
             {
                 "message_id": "msg-1",
                 "time_created": 1000,
-                "data": json.dumps({"type": "user_message", "text": "first"}),
+                "type": "user",
+                "data": json.dumps({"text": "first"}),
             },
         ])
         fts = _create_fts_db(db_paths[1])
@@ -452,10 +466,10 @@ class TestIncrementalSync:
         assert count == 0
 
     def test_new_rows_are_synced(self, db_paths, primary_with_new_row, fts_conn_with_watermarks):
-        """New parts since last watermark are synced into FTS.
+        """New session_message rows since last watermark are synced into FTS.
 
-        Watermarks are ts=1000, rid=2. Parts at rowids 1, 2, 3 (ts 1000, 1500, 2000)
-        and new part at rowid 4 (ts 2500). Due to OR logic:
+        Watermarks are ts=1000, rid=2. session_message at rowids 1, 2, 3 (ts 1000, 1500, 2000)
+        and new session_message at rowid 4 (ts 2500). Due to OR logic:
           - rowid=2 (ts=1500): time > 1000 → synced
           - rowid=3 (ts=2000): rowid > 2 → synced
           - rowid=4 (ts=2500): rowid > 2 → synced
@@ -477,12 +491,14 @@ class TestIncrementalSync:
             {
                 "message_id": "msg-old",
                 "time_created": 1000,
-                "data": json.dumps({"type": "user_message", "text": "old row"}),
+                "type": "user",
+                "data": json.dumps({"text": "old row"}),
             },
             {
                 "message_id": "msg-new",
                 "time_created": 2000,
-                "data": json.dumps({"type": "agent_message", "text": "new row"}),
+                "type": "assistant",
+                "data": json.dumps({"text": "new row"}),
             },
         ])
         fts = _create_fts_db(db_paths[1])
@@ -512,9 +528,9 @@ class TestIncrementalSync:
         assert new == 1
 
     def test_binary_data_is_sanitized(self, db_paths, primary_with_binary_data, fts_conn_with_watermarks):
-        """Binary / control characters in part data are stripped before FTS indexing.
+        """Binary / control characters in session_message data are stripped before FTS indexing.
 
-        Parts: rowid=1 (ts=1000, "clean text"), rowid=2 (ts=1500, binary text).
+        session_message: rowid=1 (ts=1000, "clean text"), rowid=2 (ts=1500, binary text).
         Watermarks: ts=1000, rid=2. Due to OR logic:
           - rowid=1 (ts=1000): neither met → skipped
           - rowid=2 (ts=1500): time > 1000 → synced
@@ -522,7 +538,7 @@ class TestIncrementalSync:
         count = self._sync(db_paths[0], fts_conn_with_watermarks, primary_with_binary_data)
         assert count == 1  # only rowid=2 is new (time > 1000)
 
-        # The part with binary data should have been sanitized
+        # The session_message with binary data should have been sanitized
         row = fts_conn_with_watermarks.execute(
             "SELECT text FROM part_fts WHERE message_id = 'msg-binary'"
         ).fetchone()
@@ -538,9 +554,9 @@ class TestIncrementalSync:
         assert "here" in text
 
     def test_invalid_json_handled_gracefully(self, db_paths, primary_with_invalid_json, fts_conn_with_watermarks):
-        """Parts with invalid JSON in the data field are skipped (not synced).
+        """session_message with invalid JSON in the data field are skipped (not synced).
 
-        Parts: rowid=1 (ts=1000, valid JSON), rowid=2 (ts=1500, invalid JSON).
+        session_message: rowid=1 (ts=1000, valid JSON), rowid=2 (ts=1500, invalid JSON).
         Watermarks: ts=1000, rid=2. Due to OR logic:
           - rowid=1 (ts=1000): neither met → skipped
           - rowid=2 (ts=1500): time > 1000 → would be synced BUT json_valid=0 filters it out
@@ -548,14 +564,14 @@ class TestIncrementalSync:
         count = self._sync(db_paths[0], fts_conn_with_watermarks, primary_with_invalid_json)
         assert count == 0  # invalid JSON filtered by query, rowid=1 skipped by watermark
 
-        # Invalid part should NOT be in FTS
+        # Invalid session_message should NOT be in FTS
         invalid_row = fts_conn_with_watermarks.execute(
             "SELECT COUNT(*) AS cnt FROM part_fts WHERE message_id = 'msg-2'"
         ).fetchone()["cnt"]
         assert invalid_row == 0
 
     def test_empty_data_handled(self, db_paths, primary_with_empty_parts, fts_conn_with_watermarks):
-        """Parts with empty/null/field-less data are skipped by the query."""
+        """session_message with empty/null/field-less data are skipped by the query."""
         count = self._sync(db_paths[0], fts_conn_with_watermarks, primary_with_empty_parts)
         assert count == 0  # none pass the json_valid + content check
 
@@ -565,7 +581,8 @@ class TestIncrementalSync:
             {
                 "message_id": "msg-1",
                 "time_created": 1000,
-                "data": json.dumps({"type": "user_message", "text": "first"}),
+                "type": "user",
+                "data": json.dumps({"text": "first"}),
             },
         ])
         fts = _create_fts_db(db_paths[1])
@@ -580,21 +597,21 @@ class TestIncrementalSync:
         )
         fts.commit()
 
-        # Insert 3 new parts
+        # Insert 3 new session_message
         primary.execute(
-            "INSERT INTO part (session_id, message_id, time_created, data) "
-            "VALUES ('sess-001', 'msg-a', 2000, ?)",
-            (json.dumps({"type": "user", "text": "a"}),),
+            "INSERT INTO session_message (session_id, id, time_created, type, data) "
+            "VALUES ('sess-001', 'msg-a', 2000, 'user', ?)",
+            (json.dumps({"text": "a"}),),
         )
         primary.execute(
-            "INSERT INTO part (session_id, message_id, time_created, data) "
-            "VALUES ('sess-001', 'msg-b', 3000, ?)",
-            (json.dumps({"type": "agent", "text": "b"}),),
+            "INSERT INTO session_message (session_id, id, time_created, type, data) "
+            "VALUES ('sess-001', 'msg-b', 3000, 'assistant', ?)",
+            (json.dumps({"text": "b"}),),
         )
         primary.execute(
-            "INSERT INTO part (session_id, message_id, time_created, data) "
-            "VALUES ('sess-001', 'msg-c', 4000, ?)",
-            (json.dumps({"type": "user", "text": "c"}),),
+            "INSERT INTO session_message (session_id, id, time_created, type, data) "
+            "VALUES ('sess-001', 'msg-c', 4000, 'user', ?)",
+            (json.dumps({"text": "c"}),),
         )
         primary.commit()
 
@@ -642,14 +659,14 @@ class TestIncrementalSync:
         result = parse_part_data('{"type": "image", "content": "image data"}')
         assert result["type"] == "image"
 
-        # Invalid JSON → fallback
+        # Invalid JSON → fallback (returns {"text": sanitized_raw_data})
         result = parse_part_data("not json")
-        assert result["type"] == "parse_error"
+        assert "text" in result
         assert "not json" in result["text"]
 
         # Empty string
         result = parse_part_data("")
-        assert result["type"] == "parse_error"
+        assert "text" in result
 
 
 # ---------------------------------------------------------------------------

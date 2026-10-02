@@ -56,21 +56,21 @@ MCP read primary opencode database (via
 ``FTS_DB_PATH``).  The ``SERVER_NAME`` env var identifies this instance
 so that rows in the shared FTS index are tagged and can be filtered.
 
-    ┌────────────────────────────────────┐ 
-    │  MCP instance                      │s
+    ┌────────────────────────────────────┐
+    │  MCP instance                      │
     │  SERVER_NAME=memory                │
     │                                    │
     │  DB:             (opencode.db)     │
-    │                       │            │ 
-    │  ┌────────┐           │            │
-    │  │  part  │───────────┼────────────┤─────────────────────────────
-    │  └────────┘           │            │                             │
-    │  ┌────────┐           │            │                             │
-    │  │session │────────── ┼            │                             │
-    │  └────────┘                        │                             │
-    └────────────────────────────────────┘                             │            
+    │                       │            │
+    │  ┌────────────────────┐           │
+    │  │ session_message    │───────────┼─────────────────────────────
+    │  └────────────────────┘           │                             │
+    │  ┌────────────────────┐           │                             │
+    │  │ session_v2         │───────────┼                             │
+    │  └────────────────────┘           │                             │
+    └────────────────────────────────────┘                             │
                                                                        │
-    FTS Database created (opencode.db_fts.db)                          │
+    Shared FTS Database (opencode.db_fts.db)                           │
     ┌──────────────────────────────────────────────────────────────┐   │
     │  part_fts  (FTS5)  ← includes a "server" column for tagging  │ ◄─┘
     │  part_fts_meta (per-server watermarks)                       │

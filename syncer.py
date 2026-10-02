@@ -98,28 +98,28 @@ def _incremental_sync(server: str) -> int:
     cur = primary_conn.cursor()
     cur.execute(
         """
-      SELECT p.rowid, p.data, p.session_id, p.message_id,
-              p.id              AS part_id,
-              s.directory,
-              s.agent,
-              s.title           AS session_title,
-              s.slug            AS session_slug,
-              s.time_created    AS session_time_created,
-              p.time_created    AS part_time_created,
-              json_extract(p.data, '$.tool') AS part_tool,
-              json_extract(p.data, '$.state.title') AS part_title
-        FROM part p
-        JOIN session s ON p.session_id = s.id
-        WHERE json_valid(p.data) = 1
-          AND json_extract(p.data, '$.type') NOT IN ('step-start', 'step-finish')
+      SELECT sm.rowid AS data_rowid, sm.data, sm.session_id, sm.type,
+              sm.id              AS message_id,
+              sm.id              AS part_id,
+              sv.directory,
+              sv.agent,
+              sv.title           AS session_title,
+              sv.slug            AS session_slug,
+              sv.time_created    AS session_time_created,
+              sm.time_created    AS part_time_created,
+              NULL               AS part_tool,
+              NULL               AS part_title
+        FROM session_message sm
+        JOIN session_v2 sv ON sm.session_id = sv.id
+        WHERE json_valid(sm.data) = 1
+          AND sm.type IN ('user', 'assistant')
           AND (
-              json_extract(p.data, '$.text') IS NOT NULL
-              OR json_extract(p.data, '$.content') IS NOT NULL
-              OR json_extract(p.data, '$.value') IS NOT NULL
-              OR json_extract(p.data, '$.state.output') IS NOT NULL
+              json_extract(sm.data, '$.text') IS NOT NULL
+              OR json_extract(sm.data, '$.content') IS NOT NULL
+              OR json_extract(sm.data, '$.value') IS NOT NULL
           )
-          AND (p.rowid > ? OR p.time_created > ?)
-        ORDER BY p.rowid ASC
+          AND (sm.rowid > ? OR sm.time_created > ?)
+        ORDER BY sm.id ASC
         """,
         (last_rid, last_ts),
     )
@@ -148,27 +148,28 @@ def _incremental_sync(server: str) -> int:
 
         parsed = parse_part_data(data)
         text = parsed.get("text", "")
-        part_type = parsed.get("type", "unknown")
+        # The ``part_type`` lives in the SQL column, not in the JSON data.
+        part_type = row["type"] if row["type"] else "unknown"
 
         fts_conn.execute(
             """INSERT INTO part_fts
-               (rowid, text, session_id, message_id, part_id, server,
+               (data_rowid, text, session_id, message_id, part_id, server,
                 part_type, directory, agent, session_title, session_slug,
                 session_time_created, part_time_created, tool, title)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (row["rowid"], text, session_id, message_id, part_id, server,
+            (row["data_rowid"], text, session_id, message_id, part_id, server,
              part_type, directory, agent, session_title, session_slug,
              session_time_created, part_time_created,
              row["part_tool"], row["part_title"]),
         )
         count += 1
 
-        if row["rowid"] > max_rid:
-            max_rid = row["rowid"]
+        if str(row["data_rowid"]) > str(max_rid):
+            max_rid = row["data_rowid"]
 
     # Update max timestamp for the highest rowid
     cur.execute(
-        "SELECT MAX(time_created) FROM part WHERE rowid <= ?",
+        "SELECT MAX(time_created) FROM session_message WHERE rowid <= ?",
         (max_rid,),
     )
     max_ts = cur.fetchone()[0] or last_ts

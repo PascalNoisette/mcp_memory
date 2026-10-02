@@ -70,7 +70,7 @@ def get_directories() -> list[str]:
     cur = conn.cursor()
     cur.execute("""
         SELECT s.directory
-        FROM session s
+        FROM session_v2 s
         GROUP BY s.directory
         ORDER BY MAX(s.time_created) DESC
     """)
@@ -85,7 +85,7 @@ def get_session_count(directory: str) -> int:
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute(
-        "SELECT COUNT(*) AS cnt FROM session WHERE directory = ?",
+        "SELECT COUNT(*) AS cnt FROM session_v2 WHERE directory = ?",
         (directory,),
     )
     count = cur.fetchone()["cnt"]
@@ -105,10 +105,10 @@ def get_session_with_most_parts(directory: str, min_parts: int = 50):
     cur.execute(
         """
         SELECT s.id, s.title
-        FROM session s
+        FROM session_v2 s
         WHERE s.directory = ?
-          AND (SELECT COUNT(*) FROM part WHERE part.session_id = s.id) > ?
-        ORDER BY (SELECT COUNT(*) FROM part WHERE part.session_id = s.id) DESC
+          AND (SELECT COUNT(*) FROM session_message WHERE session_message.session_id = s.id) > ?
+        ORDER BY (SELECT COUNT(*) FROM session_message WHERE session_message.session_id = s.id) DESC
         LIMIT 1
         """,
         (directory, min_parts),

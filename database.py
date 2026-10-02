@@ -138,7 +138,7 @@ _fts_available = False
 
 
 def _create_primary_schema(db_path: str) -> None:
-    """Create the primary database schema (session + part tables).
+    """Create the primary database schema (session_v2 + session_message tables).
 
     This is needed when the primary database file does not exist yet
     (e.g. fresh test runs).  Opens the database in read-write mode
@@ -155,15 +155,15 @@ def _create_primary_schema(db_path: str) -> None:
     conn = sqlite3.connect(db_path)
     try:
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS session (
+            CREATE TABLE IF NOT EXISTS session_v2 (
                 id              TEXT PRIMARY KEY,
-                slug            TEXT NOT NULL,
-                title           TEXT,
                 directory       TEXT NOT NULL,
                 agent           TEXT,
                 model           TEXT,
-                time_created    TEXT NOT NULL,
-                time_updated    TEXT NOT NULL,
+                title           TEXT,
+                slug            TEXT NOT NULL,
+                time_created    INTEGER NOT NULL,
+                time_updated    INTEGER NOT NULL,
                 tokens_input    INTEGER,
                 tokens_output   INTEGER,
                 tokens_reasoning INTEGER,
@@ -171,18 +171,20 @@ def _create_primary_schema(db_path: str) -> None:
             )
         """)
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS part (
+            CREATE TABLE IF NOT EXISTS session_message (
                 id              TEXT PRIMARY KEY,
-                message_id      TEXT NOT NULL,
                 session_id      TEXT NOT NULL,
-                time_created    TEXT NOT NULL,
+                type            TEXT NOT NULL,
+                seq             INTEGER,
+                time_created    INTEGER NOT NULL,
+                time_updated    INTEGER NOT NULL,
                 data            TEXT,
-                FOREIGN KEY (session_id) REFERENCES session(id)
+                FOREIGN KEY (session_id) REFERENCES session_v2(id)
             )
         """)
         conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_part_session
-            ON part (session_id)
+            CREATE INDEX IF NOT EXISTS idx_message_session
+            ON session_message (session_id)
         """)
         conn.commit()
     finally:
@@ -308,6 +310,7 @@ def _ensure_fts_schema(conn: sqlite3.Connection) -> None:
     queries can filter by server without a JOIN.
     """
     fts_cols = [
+        "data_rowid",
         "text",
         "session_id",
         "message_id",
@@ -437,27 +440,28 @@ def _do_fts_init(server: str) -> None:
             cur = primary_conn.cursor()
             cur.execute(
                 """
-                SELECT p.rowid, p.data, p.session_id, p.message_id,
-                       p.id              AS part_id,
-                       s.directory,
-                       s.agent,
-                       s.title           AS session_title,
-                       s.slug            AS session_slug,
-                       s.time_created    AS session_time_created,
-                       p.time_created    AS part_time_created,
-                       json_extract(p.data, '$.tool') AS part_tool,
-                       json_extract(p.data, '$.state.title') AS part_title
-                FROM part p
-                JOIN session s ON p.session_id = s.id
-                WHERE json_valid(p.data) = 1
-                  AND json_extract(p.data, '$.type') NOT IN ('step-start', 'step-finish')
+                SELECT sm.id AS data_rowid, sm.data, sm.session_id, sm.type,
+                       sm.id              AS message_id,
+                       sm.id              AS part_id,
+                       sv.directory,
+                       sv.agent,
+                       sv.title           AS session_title,
+                       sv.slug            AS session_slug,
+                       sv.time_created    AS session_time_created,
+                       sm.time_created    AS part_time_created,
+                       NULL               AS part_tool,
+                       NULL               AS part_title
+                FROM session_message sm
+                JOIN session_v2 sv ON sm.session_id = sv.id
+                WHERE json_valid(sm.data) = 1
+                  AND sm.type IN ('user', 'assistant')
                   AND (
-                      json_extract(p.data, '$.text') IS NOT NULL
-                      OR json_extract(p.data, '$.content') IS NOT NULL
-                      OR json_extract(p.data, '$.value') IS NOT NULL
-                      OR json_extract(p.data, '$.state.output') IS NOT NULL
+                      json_extract(sm.data, '$.text') IS NOT NULL
+                      OR json_extract(sm.data, '$.content') IS NOT NULL
+                      OR json_extract(sm.data, '$.value') IS NOT NULL
+                      OR json_extract(sm.data, '$.state.output') IS NOT NULL
                   )
-                ORDER BY p.rowid ASC
+                ORDER BY sm.id ASC
                 """
             )
             rows = cur.fetchall()
@@ -479,15 +483,16 @@ def _do_fts_init(server: str) -> None:
                 from formatters import parse_part_data
                 parsed = parse_part_data(data)
                 text = parsed.get("text", "")
-                part_type = parsed.get("type", "unknown")
+                # The ``part_type`` lives in the SQL column, not in the JSON data.
+                part_type = row["type"] if row["type"] else "unknown"
 
                 fts_conn.execute(
                     """INSERT INTO part_fts
-                       (rowid, text, session_id, message_id, part_id, server,
+                       (data_rowid, text, session_id, message_id, part_id, server,
                         part_type, directory, agent, session_title, session_slug,
                         session_time_created, part_time_created, tool, title)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (row["rowid"], text, session_id, message_id, part_id, server,
+                    (row["data_rowid"], text, session_id, message_id, part_id, server,
                      part_type, directory, agent, session_title, session_slug,
                      session_time_created, part_time_created,
                      row["part_tool"], row["part_title"]),

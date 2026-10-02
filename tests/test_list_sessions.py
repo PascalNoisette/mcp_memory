@@ -124,7 +124,7 @@ class TestListSessionsPagination(TestBase):
         cur = conn.cursor()
         for p in projects:
             cur.execute(
-                "SELECT COUNT(*) AS cnt FROM session WHERE directory = ?",
+                "SELECT COUNT(*) AS cnt FROM session_v2 WHERE directory = ?",
                 (p["directory"],),
             )
             cnt = cur.fetchone()["cnt"]

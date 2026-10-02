@@ -64,7 +64,7 @@ def directories(db_path: str) -> list[str]:
     cur = conn.cursor()
     cur.execute("""
         SELECT s.directory
-        FROM session s
+        FROM session_v2 s
         GROUP BY s.directory
         ORDER BY MAX(s.time_created) DESC
     """)
@@ -96,7 +96,7 @@ def project_with_many_sessions(directories: list[str]) -> str:
 
     for d in directories:
         cur.execute(
-            "SELECT COUNT(*) AS cnt FROM session WHERE directory = ?",
+            "SELECT COUNT(*) AS cnt FROM session_v2 WHERE directory = ?",
             (d,),
         )
         cnt = cur.fetchone()["cnt"]
@@ -121,7 +121,7 @@ def sample_session_id(directories: list[str]) -> str:
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute(
-        "SELECT id FROM session WHERE directory = ? ORDER BY time_created DESC LIMIT 1",
+        "SELECT id FROM session_v2 WHERE directory = ? ORDER BY time_created DESC LIMIT 1",
         (directories[0],),
     )
     row = cur.fetchone()

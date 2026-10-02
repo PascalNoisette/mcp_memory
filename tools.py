@@ -71,7 +71,7 @@ def list_projects(response_format: str = "markdown") -> str:
     """List all Kilo Code projects (directories) from the local conversation database.
 
     Projects are derived from session data using:
-    ``SELECT directory, COUNT(*) FROM session GROUP BY directory``.
+    ``SELECT directory, COUNT(*) FROM session_v2 GROUP BY directory``.
 
     Returns directory paths with session counts and latest session timestamps.
 

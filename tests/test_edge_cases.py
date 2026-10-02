@@ -180,11 +180,11 @@ class TestEdgeCaseUnicodeText(TestBase):
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute("""
-            SELECT s.id, s.title FROM session s
+            SELECT s.id, s.title FROM session_v2 s
             WHERE (s.title LIKE '%La%' OR s.title LIKE '%base de données%'
                    OR s.title LIKE '%struct%' OR s.title LIKE '%opencode%')
-              AND (SELECT COUNT(*) FROM part WHERE part.session_id = s.id) > 0
-            ORDER BY (SELECT COUNT(*) FROM part WHERE part.session_id = s.id) DESC
+              AND (SELECT COUNT(*) FROM session_message WHERE session_message.session_id = s.id) > 0
+            ORDER BY (SELECT COUNT(*) FROM session_message WHERE session_message.session_id = s.id) DESC
             LIMIT 1
         """)
         row = cur.fetchone()
@@ -354,7 +354,7 @@ class TestEdgeCaseConsistency(TestBase):
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(
-            "SELECT COUNT(*) AS cnt FROM session WHERE directory = ?",
+            "SELECT COUNT(*) AS cnt FROM session_v2 WHERE directory = ?",
             (directory,),
         )
         db_count = cur.fetchone()["cnt"]
@@ -368,7 +368,7 @@ class TestEdgeCaseConsistency(TestBase):
 
 
 class TestEdgeCaseBinarySanitization(TestBase):
-    """Binary characters in part.data must not leak into MCP output."""
+    """Binary characters in session_message.data must not leak into MCP output."""
 
     def setUp(self):
         super().setUp()
@@ -377,8 +377,8 @@ class TestEdgeCaseBinarySanitization(TestBase):
         cur = conn.cursor()
         # Find a real session to attach corrupted data to
         cur.execute("""
-            SELECT s.id, s.directory FROM session s
-            WHERE (SELECT COUNT(*) FROM part p WHERE p.session_id = s.id) > 0
+            SELECT s.id, s.directory FROM session_v2 s
+            WHERE (SELECT COUNT(*) FROM session_message sm WHERE sm.session_id = s.id) > 0
             LIMIT 1
         """)
         row = cur.fetchone()
@@ -393,15 +393,17 @@ class TestEdgeCaseBinarySanitization(TestBase):
 
         conn = sqlite3.connect(_clean_db_path())
         cur = conn.cursor()
-        # Insert a part with binary characters in the text field
+        # Clean up any leftover rows from previous runs
+        cur.execute("DELETE FROM session_message WHERE id = 'test-binary-001'")
+        conn.commit()
+        # Insert a session_message with binary characters in the text field
         corrupt_json = json.dumps({
-            "type": "user_message",
             "text": "Hello\x00World\x01Foo\x1fBar",
         })
         cur.execute(
-            "INSERT INTO part (session_id, message_id, time_created, time_updated, data) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (self.binary_session_id, "test-binary-001", int(1700000000000), int(1700000000000), corrupt_json),
+            "INSERT INTO session_message (session_id, id, seq, time_created, time_updated, type, data) "
+            "VALUES (?, ?, ?, ?, ?, 'user', ?)",
+            (self.binary_session_id, "test-binary-001", 9999001, int(1700000000000), int(1700000000000), corrupt_json),
         )
         conn.commit()
         conn.close()
@@ -427,7 +429,7 @@ class TestEdgeCaseBinarySanitization(TestBase):
         # Clean up injected row
         conn = sqlite3.connect(_clean_db_path())
         conn.execute(
-            "DELETE FROM part WHERE message_id = 'test-binary-001'",
+            "DELETE FROM session_message WHERE id = 'test-binary-001'",
         )
         conn.commit()
         conn.close()
@@ -439,14 +441,16 @@ class TestEdgeCaseBinarySanitization(TestBase):
 
         conn = sqlite3.connect(_clean_db_path())
         cur = conn.cursor()
+        # Clean up any leftover rows from previous runs
+        cur.execute("DELETE FROM session_message WHERE id = 'test-binary-002'")
+        conn.commit()
         corrupt_json = json.dumps({
-            "type": "agent_message",
             "text": "Found\x00the\x01keyword\x1fcode",
         })
         cur.execute(
-            "INSERT INTO part (session_id, message_id, time_created, time_updated, data) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (self.binary_session_id, "test-binary-002", int(1700000000000), int(1700000000000), corrupt_json),
+            "INSERT INTO session_message (session_id, id, seq, time_created, time_updated, type, data) "
+            "VALUES (?, ?, ?, ?, ?, 'assistant', ?)",
+            (self.binary_session_id, "test-binary-002", 9999002, int(1700000000000), int(1700000000000), corrupt_json),
         )
         conn.commit()
         conn.close()
@@ -468,7 +472,7 @@ class TestEdgeCaseBinarySanitization(TestBase):
         # Clean up
         conn = sqlite3.connect(_clean_db_path())
         conn.execute(
-            "DELETE FROM part WHERE message_id = 'test-binary-002'",
+            "DELETE FROM session_message WHERE id = 'test-binary-002'",
         )
         conn.commit()
         conn.close()

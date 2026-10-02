@@ -16,6 +16,7 @@ title/slug, and timestamps.  Queries run entirely against the FTS table
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Optional
 
@@ -96,14 +97,14 @@ def _ensure_fts_available() -> None:
 def fetch_projects() -> list[dict[str, Any]]:
     """Return all projects (directories) with session counts.
 
-    Queries ``SELECT directory, COUNT(*) FROM session GROUP BY directory``
+    Queries ``SELECT directory, COUNT(*) FROM session_v2 GROUP BY directory``
     to derive projects from actual session data instead of the project table.
     """
     rows = _query(
         """
         SELECT s.directory, COUNT(*) AS session_count,
                MAX(s.time_created) AS latest_session_time
-        FROM session s
+        FROM session_v2 s
         GROUP BY s.directory
         ORDER BY latest_session_time DESC
         """
@@ -124,7 +125,7 @@ def fetch_projects() -> list[dict[str, Any]]:
 def fetch_session_count(directory: str) -> int:
     """Return the total number of sessions for a directory."""
     rows = _query(
-        "SELECT COUNT(*) as cnt FROM session WHERE directory = ?",
+        "SELECT COUNT(*) as cnt FROM session_v2 WHERE directory = ?",
         (directory,),
     )
     return rows[0]["cnt"]
@@ -142,7 +143,7 @@ def fetch_sessions(
                time_created, time_updated,
                tokens_input, tokens_output, tokens_reasoning,
                cost
-        FROM session
+        FROM session_v2
         WHERE directory = ?
         ORDER BY time_created DESC
         LIMIT ? OFFSET ?
@@ -170,6 +171,108 @@ def fetch_sessions(
 # ── Messages ─────────────────────────────────────────────────────────────────
 
 
+def _expand_assistant_parts(
+    parent_id: str,
+    content: list[dict[str, Any]],
+    time_created_ms: int,
+) -> list[dict[str, Any]]:
+    """Expand an assistant message with multiple content parts into
+    separate message entries (one per part).
+
+    Each non-tool part (``reasoning``, ``text``) is combined into a single
+    ``assistant`` message.  Each ``tool`` part becomes its own ``tool``
+    message entry with the tool name, input and output in the ``text`` field.
+
+    Args:
+        parent_id: The original session_message id (used as part_id for
+                   the assistant entry; each tool gets a synthetic id).
+        content: The ``content`` array from the assistant message JSON.
+        time_created_ms: Timestamp in milliseconds (used for the assistant
+                         entry; tool entries inherit this timestamp).
+
+    Returns:
+        List of message dicts, one per content part.
+    """
+    messages: list[dict[str, Any]] = []
+    assistant_parts: list[str] = []
+
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type", "")
+        part_text = part.get("text", "")
+
+        if part_type == "tool":
+            # Build a synthetic tool message entry.
+            # Tool data structure: {"type": "tool", "id": "...", "name": "...",
+            #   "executed": bool, "state": {"status": "...", "input": {...}, "content": [...]}}
+            name = part.get("name", "unknown")
+            tool_id = part.get("id", "")
+            executed = part.get("executed", False)
+            state = part.get("state", {})
+            status = state.get("status", "unknown")
+            tool_input = state.get("input", {})
+            tool_content = state.get("content", [])
+
+            # Build the text: tool name, input, and output.
+            exec_status = "executed" if executed else "not executed"
+            lines: list[str] = [
+                f"Tool: {name}",
+                f"Tool ID: {tool_id}",
+                f"Executed: {exec_status}",
+                f"State status: {status}",
+            ]
+            if tool_input:
+                inp_str = json.dumps(tool_input, ensure_ascii=False) if isinstance(tool_input, dict) else str(tool_input)
+                lines.append(f"Input: {inp_str[:500]}")
+            if tool_content:
+                # Collect text content from state.content parts.
+                output_parts: list[str] = []
+                for tc in tool_content:
+                    if isinstance(tc, dict) and tc.get("type") == "text":
+                        output_parts.append(tc.get("text", ""))
+                if output_parts:
+                    out_str = "\n".join(output_parts)
+                    lines.append(f"Output: {out_str[:500]}")
+            tool_text = "\n".join(lines)
+            tool_text = sanitize_text(tool_text)
+
+            messages.append(
+                {
+                    "part_id": tool_id if tool_id else f"{parent_id}_tool",
+                    "time_created": format_timestamp(time_created_ms),
+                    "type": "tool",
+                    "text": tool_text,
+                    "full_text_length": len(tool_text),
+                    "raw_data": json.dumps(part),
+                    "state_title": None,
+                    "state_tool": name,
+                }
+            )
+        else:
+            # Non-tool part: collect for the assistant entry.
+            if isinstance(part_text, str) and part_text.strip():
+                assistant_parts.append(part_text)
+
+    # Add the combined assistant entry.
+    if assistant_parts:
+        messages.insert(
+            0,
+            {
+                "part_id": parent_id,
+                "time_created": format_timestamp(time_created_ms),
+                "type": "assistant",
+                "text": sanitize_text("\n\n".join(assistant_parts)),
+                "full_text_length": len(sanitize_text("\n\n".join(assistant_parts))),
+                "raw_data": json.dumps({"content": content}),
+                "state_title": None,
+                "state_tool": None,
+            },
+        )
+
+    return messages
+
+
 def _fetch_messages_with_count(
     session_id: str,
     page_size: int,
@@ -190,13 +293,13 @@ def _fetch_messages_with_count(
     conn = get_db()
     cur = conn.cursor()
 
-    # 1. Total count (snapshot at transaction start) — exclude step-start/step-finish
+    # 1. Total count (snapshot at transaction start) — filter to user/assistant
     cur.execute(
         """
-        SELECT COUNT(*) as cnt FROM part
+        SELECT COUNT(*) as cnt FROM session_message
         WHERE session_id = ?
           AND json_valid(data) = 1
-          AND json_extract(data, '$.type') NOT IN ('step-start', 'step-finish')
+          AND type IN ('user', 'assistant')
         """,
         (session_id,),
     )
@@ -205,13 +308,14 @@ def _fetch_messages_with_count(
     # 2. Paginated messages (same snapshot — no new inserts visible)
     cur.execute(
         """
-        SELECT id, message_id, time_created, data,
-               json_extract(data, '$.state.title') AS state_title,
-               json_extract(data, '$.state.tool')  AS state_tool
-        FROM part
+        SELECT id, time_created, data,
+               type,
+               NULL AS state_title,
+               NULL AS state_tool
+        FROM session_message
         WHERE session_id = ?
           AND json_valid(data) = 1
-          AND json_extract(data, '$.type') NOT IN ('step-start', 'step-finish')
+          AND type IN ('user', 'assistant')
         ORDER BY time_created ASC
         LIMIT ? OFFSET ?
         """,
@@ -223,14 +327,37 @@ def _fetch_messages_with_count(
     for row in rows:
         parsed = parse_part_data(row["data"] or "{}")
         text = sanitize_text(parsed.get("text", ""))
+        # The ``type`` lives in the SQL column, not in the JSON data.
+        msg_type = row["type"] if row["type"] else "unknown"
+
+        # Expand assistant messages that contain tool parts into
+        # separate message entries (one per content part).
+        raw_data = row["data"] or "{}"
+        if msg_type == "assistant":
+            try:
+                data_obj = json.loads(raw_data)
+                content = data_obj.get("content", [])
+                if isinstance(content, list) and len(content) > 1:
+                    # There are multiple content parts — expand them.
+                    messages.extend(
+                        _expand_assistant_parts(
+                            row["id"],
+                            content,
+                            row["time_created"],
+                        )
+                    )
+                    continue
+            except (json.JSONDecodeError, TypeError):
+                pass
+
         messages.append(
             {
                 "part_id": row["id"],
                 "time_created": format_timestamp(row["time_created"]),
-                "type": parsed.get("type", "unknown"),
+                "type": msg_type,
                 "text": text,
                 "full_text_length": len(text),
-                "raw_data": row["data"],
+                "raw_data": raw_data,
                 "state_title": row["state_title"],
                 "state_tool": row["state_tool"],
             }
@@ -242,7 +369,7 @@ def _fetch_messages_with_count(
 def fetch_message_count(session_id: str) -> int:
     """Return the total number of messages (parts) for a session."""
     rows = _query(
-        "SELECT COUNT(*) as cnt FROM part WHERE session_id = ?",
+        "SELECT COUNT(*) as cnt FROM session_message WHERE session_id = ?",
         (session_id,),
     )
     return rows[0]["cnt"]

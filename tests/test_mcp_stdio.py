@@ -155,23 +155,23 @@ def main() -> int:
             f"Found: {tool_names}",
         )
 
-        # ── Step 3: Find a session with many parts ──────────────────────
+        # ── Step 3: Find a session with many messages ──────────────────────
         print("\n=== Step 3: Discover session ===")
         conn = sqlite3.connect(_clean_db_path())
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute("""
-            SELECT s.id, s.title, COUNT(p.id) as part_count
-            FROM session s
-            JOIN part p ON p.session_id = s.id
+            SELECT s.id, s.title, COUNT(sm.id) as message_count
+            FROM session_v2 s
+            JOIN session_message sm ON sm.session_id = s.id
             GROUP BY s.id
-            ORDER BY part_count DESC
+            ORDER BY message_count DESC
             LIMIT 1
         """)
         row = cur.fetchone()
 
         if not row:
-            print("  [SKIP] No sessions with parts found!")
+            print("  [SKIP] No sessions with messages found!")
             conn.close()
             proc.stdin.close()
             proc.wait(timeout=5)
@@ -253,7 +253,7 @@ def main() -> int:
         # ── Step 8: list_sessions with direct fields ────────────────────
         print("\n=== Step 8: list_sessions with direct fields ===")
         cur.execute(
-            "SELECT directory FROM session ORDER BY time_created DESC LIMIT 1"
+            "SELECT directory FROM session_v2 ORDER BY time_created DESC LIMIT 1"
         )
         top_dir = cur.fetchone()["directory"]
         cur.close()

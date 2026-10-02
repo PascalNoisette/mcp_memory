@@ -10,7 +10,7 @@ Entry-point that bootstraps the application by importing all layers
 Each MCP instance manages **one** primary opencode database (via
 ``DATABASE_PATH``) and writes to a **shared** FTS index (via
 ``FTS_DB_PATH``).  A background sync thread periodically copies new
-``part`` rows from the primary into the FTS index:
+``session_message`` rows from the primary into the FTS index:
 
     Primary DB (opencode-local.db)  ──sync──►  FTS DB (shared-fts.db)
 
